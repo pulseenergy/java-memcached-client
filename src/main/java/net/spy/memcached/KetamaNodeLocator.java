@@ -185,7 +185,7 @@ public final class KetamaNodeLocator extends SpyObject implements NodeLocator {
                     | ((long) (digest[1 + h * 4] & 0xFF) << 8)
                     | (digest[h * 4] & 0xFF);
             newNodeMap.put(k, node);
-            getLogger().debug("Adding node %s in position %d", node, k);
+            getLogger().debug("Adding node {} in position {}", node, k);
           }
         }
       } else {

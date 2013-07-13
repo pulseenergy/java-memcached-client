@@ -97,7 +97,7 @@ abstract class BaseGetOpImpl extends OperationImpl {
       transitionState(OperationState.COMPLETE);
       data = null;
     } else if (line.startsWith("VALUE ")) {
-      getLogger().debug("Got line %s", line);
+      getLogger().debug("Got line {}", line);
       String[] stuff = line.split(" ");
       assert stuff[0].equals("VALUE");
       currentKey = stuff[1];
@@ -126,13 +126,13 @@ abstract class BaseGetOpImpl extends OperationImpl {
     assert readOffset <= data.length : "readOffset is " + readOffset
         + " data.length is " + data.length;
 
-    getLogger().debug("readOffset: %d, length: %d", readOffset, data.length);
+    getLogger().debug("readOffset: {}, length: {}", readOffset, data.length);
     // If we're not looking for termination, we're still looking for data
     if (lookingFor == '\0') {
       int toRead = data.length - readOffset;
       int available = b.remaining();
       toRead = Math.min(toRead, available);
-      getLogger().debug("Reading %d bytes", toRead);
+      getLogger().debug("Reading {} bytes", toRead);
       b.get(data, readOffset, toRead);
       readOffset += toRead;
     }

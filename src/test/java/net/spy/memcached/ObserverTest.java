@@ -76,11 +76,11 @@ public class ObserverTest extends ClientBaseCase {
 
   static class LoggingObserver extends SpyObject implements ConnectionObserver {
     public void connectionEstablished(SocketAddress sa, int reconnectCount) {
-      getLogger().info("Connection established to %s (%s)", sa, reconnectCount);
+      getLogger().info("Connection established to {} ({})", sa, reconnectCount);
     }
 
     public void connectionLost(SocketAddress sa) {
-      getLogger().info("Connection lost from %s", sa);
+      getLogger().info("Connection lost from {}", sa);
     }
   }
 }

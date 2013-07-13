@@ -111,7 +111,7 @@ public class WhalinTranscoder extends BaseSerializingTranscoder implements
         rv = decodeCharacter(data);
         break;
       default:
-        getLogger().warn("Cannot handle data with flags %x", f);
+        getLogger().warn("Cannot handle data with flags {}", f);
       }
     }
     return rv;
@@ -170,12 +170,12 @@ public class WhalinTranscoder extends BaseSerializingTranscoder implements
     if (b.length > compressionThreshold) {
       byte[] compressed = compress(b);
       if (compressed.length < b.length) {
-        getLogger().debug("Compressed %s from %d to %d",
+        getLogger().debug("Compressed {} from {} to {}",
           o.getClass().getName(), b.length, compressed.length);
         b = compressed;
         flags |= COMPRESSED;
       } else {
-        getLogger().info("Compression increased the size of %s from %d to %d",
+        getLogger().info("Compression increased the size of {} from {} to {}",
             o.getClass().getName(), b.length, compressed.length);
       }
     }

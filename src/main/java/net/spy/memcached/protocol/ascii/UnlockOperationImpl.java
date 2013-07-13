@@ -59,7 +59,7 @@ final class UnlockOperationImpl extends OperationImpl implements
 
   @Override
   public void handleLine(String line) {
-    getLogger().debug("Unlock of %s returned %s", key, line);
+    getLogger().debug("Unlock of {} returned {}", key, line);
     getCallback().receivedStatus(matchStatus(line, UNLOCKED, NOT_FOUND));
     transitionState(OperationState.COMPLETE);
   }

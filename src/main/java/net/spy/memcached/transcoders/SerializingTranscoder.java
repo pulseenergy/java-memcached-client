@@ -113,7 +113,7 @@ public class SerializingTranscoder extends BaseSerializingTranscoder implements
         rv = data;
         break;
       default:
-        getLogger().warn("Undecodeable with flags %x", flags);
+        getLogger().warn("Undecodeable with flags {}", flags);
       }
     } else {
       rv = decodeString(data);
@@ -166,12 +166,12 @@ public class SerializingTranscoder extends BaseSerializingTranscoder implements
     if (b.length > compressionThreshold) {
       byte[] compressed = compress(b);
       if (compressed.length < b.length) {
-        getLogger().debug("Compressed %s from %d to %d",
+        getLogger().debug("Compressed {} from {} to {}",
             o.getClass().getName(), b.length, compressed.length);
         b = compressed;
         flags |= COMPRESSED;
       } else {
-        getLogger().info("Compression increased the size of %s from %d to %d",
+        getLogger().info("Compression increased the size of {} from {} to {}",
             o.getClass().getName(), b.length, compressed.length);
       }
     }

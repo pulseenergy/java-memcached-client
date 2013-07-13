@@ -51,7 +51,6 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import net.spy.memcached.compat.SpyThread;
-import net.spy.memcached.compat.log.LoggerFactory;
 import net.spy.memcached.internal.OperationFuture;
 import net.spy.memcached.ops.KeyedOperation;
 import net.spy.memcached.ops.NoopOperation;
@@ -65,6 +64,7 @@ import net.spy.memcached.ops.VBucketAware;
 import net.spy.memcached.protocol.binary.BinaryOperationFactory;
 import net.spy.memcached.protocol.binary.TapAckOperationImpl;
 import net.spy.memcached.util.StringUtils;
+import org.slf4j.LoggerFactory;
 
 /**
  * Connection to a cluster of memcached servers.
@@ -162,10 +162,10 @@ public class MemcachedConnection extends SpyThread {
       // connect, but it considerably slowed down start time.
       try {
         if (ch.connect(sa)) {
-          getLogger().info("Connected to %s immediately", qa);
+          getLogger().info("Connected to {} immediately", qa);
           connected(qa);
         } else {
-          getLogger().info("Added %s to connect queue", qa);
+          getLogger().info("Added {} to connect queue", qa);
           ops = SelectionKey.OP_CONNECT;
         }
 
@@ -231,7 +231,7 @@ public class MemcachedConnection extends SpyThread {
       long then = reconnectQueue.firstKey();
       delay = Math.max(then - now, 1);
     }
-    getLogger().debug("Selecting with delay of %sms", delay);
+    getLogger().debug("Selecting with delay of {}ms", delay);
     assert selectorsMakeSense() : "Selectors don't make sense.";
     int selected = selector.select(delay);
     Set<SelectionKey> selectedKeys = selector.selectedKeys();
@@ -241,10 +241,10 @@ public class MemcachedConnection extends SpyThread {
           + Thread.interrupted());
       if (++emptySelects > DOUBLE_CHECK_EMPTY) {
         for (SelectionKey sk : selector.keys()) {
-          getLogger().debug("%s has %s, interested in %s", sk, sk.readyOps(),
+          getLogger().debug("{} has {}, interested in {}", sk, sk.readyOps(),
               sk.interestOps());
           if (sk.readyOps() != 0) {
-            getLogger().debug("%s has a ready op, handling IO", sk);
+            getLogger().debug("{} has a ready op, handling IO", sk);
             handleIO(sk);
           } else {
             lostConnection((MemcachedNode) sk.attachment());
@@ -253,7 +253,7 @@ public class MemcachedConnection extends SpyThread {
         assert emptySelects < EXCESSIVE_EMPTY : "Too many empty selects";
       }
     } else {
-      getLogger().debug("Selected %d, selected %d keys", selected,
+      getLogger().debug("Selected {}, selected {} keys", selected,
           selectedKeys.size());
       emptySelects = 0;
 
@@ -270,7 +270,7 @@ public class MemcachedConnection extends SpyThread {
         for (SelectionKey sk : selector.keys()) {
           MemcachedNode mn = (MemcachedNode) sk.attachment();
           if (mn.getContinuousTimeout() > timeoutExceptionThreshold) {
-            getLogger().warn("%s exceeded continuous timeout threshold", sk);
+            getLogger().warn("{} exceeded continuous timeout threshold", sk);
             lostConnection(mn);
           }
         }
@@ -298,10 +298,10 @@ public class MemcachedConnection extends SpyThread {
           qa.getChannel().close();
           qa.setSk(null);
           if (qa.getBytesRemainingToWrite() > 0) {
-            getLogger().warn("Shut down with %d bytes remaining to write",
+            getLogger().warn("Shut down with {} bytes remaining to write",
                 qa.getBytesRemainingToWrite());
           }
-          getLogger().debug("Shut down channel %s", qa.getChannel());
+          getLogger().debug("Shut down channel {}", qa.getChannel());
         }
         redistributeOperations(notCompletedOperations);
       }
@@ -328,7 +328,7 @@ public class MemcachedConnection extends SpyThread {
         if (qa.isActive()) {
           if (qa.getCurrentWriteOp() != null) {
             readyForIO = true;
-            getLogger().debug("Handling queued write %s", qa);
+            getLogger().debug("Handling queued write {}", qa);
           }
         } else {
           toAdd.add(qa);
@@ -414,11 +414,11 @@ public class MemcachedConnection extends SpyThread {
   private void handleIO(SelectionKey sk) {
     MemcachedNode node = (MemcachedNode) sk.attachment();
     try {
-      getLogger().debug("Handling IO for:  %s (r=%s, w=%s, c=%s, op=%s)", sk,
+      getLogger().debug("Handling IO for:  {} (r={}, w={}, c={}, op={})", sk,
               sk.isReadable(), sk.isWritable(), sk.isConnectable(),
               sk.attachment());
       if (sk.isConnectable() && belongsToCluster(node)) {
-        getLogger().info("Connection state changed for %s", sk);
+        getLogger().info("Connection state changed for {}", sk);
         final SocketChannel channel = node.getChannel();
         if (channel.finishConnect()) {
 
@@ -487,18 +487,18 @@ public class MemcachedConnection extends SpyThread {
       // Note, not all channel closes end up here
       if (!shutDown) {
         getLogger().info("Closed channel and not shutting down. Queueing"
-            + " reconnect on %s", node, e);
+            + " reconnect on {}", node, e);
         lostConnection(node);
       }
     } catch (ConnectException e) {
       // Failures to establish a connection should attempt a reconnect
       // without signaling the observers.
-      getLogger().info("Reconnecting due to failure to connect to %s", node, e);
+      getLogger().info("Reconnecting due to failure to connect to {}", node, e);
       queueReconnect(node);
     } catch (OperationException e) {
       node.setupForAuth(); // noop if !shouldAuth
       getLogger().info("Reconnection due to exception handling a memcached "
-          + "operation on %s. This may be due to an authentication failure.",
+          + "operation on {}. This may be due to an authentication failure.",
           node, e);
       lostConnection(node);
     } catch (Exception e) {
@@ -508,7 +508,7 @@ public class MemcachedConnection extends SpyThread {
       // One cause is just network oddness or servers
       // restarting, which lead here with IOException
       node.setupForAuth(); // noop if !shouldAuth
-      getLogger().info("Reconnecting due to exception on %s", node, e);
+      getLogger().info("Reconnecting due to exception on {}", node, e);
       lostConnection(node);
     }
     node.fixupOps();
@@ -541,7 +541,7 @@ public class MemcachedConnection extends SpyThread {
         // If were doing tap then we won't throw an exception
         currentOp.getCallback().complete();
         ((TapOperation) currentOp).streamClosed(OperationState.COMPLETE);
-        getLogger().debug("Completed read op: %s and giving the next %d bytes",
+        getLogger().debug("Completed read op: {} and giving the next {} bytes",
             currentOp, rbuf.remaining());
         Operation op = qa.removeCurrentReadOp();
         assert op == currentOp : "Expected to pop " + currentOp + " got " + op;
@@ -553,7 +553,7 @@ public class MemcachedConnection extends SpyThread {
       }
     }
     while (read > 0) {
-      getLogger().debug("Read %d bytes", read);
+      getLogger().debug("Read {} bytes", read);
       rbuf.flip();
       while (rbuf.remaining() > 0) {
         if (currentOp == null) {
@@ -562,14 +562,14 @@ public class MemcachedConnection extends SpyThread {
         synchronized(currentOp) {
           currentOp.readFromBuffer(rbuf);
           if (currentOp.getState() == OperationState.COMPLETE) {
-            getLogger().debug("Completed read op: %s and giving the next %d "
+            getLogger().debug("Completed read op: {} and giving the next {} "
                 + "bytes", currentOp, rbuf.remaining());
             Operation op = qa.removeCurrentReadOp();
             assert op == currentOp : "Expected to pop " + currentOp + " got "
                 + op;
           } else if (currentOp.getState() == OperationState.RETRY) {
             getLogger().debug("Reschedule read op due to NOT_MY_VBUCKET error: "
-                + "%s ", currentOp);
+                + "{} ", currentOp);
             ((VBucketAware) currentOp).addNotMyVbucketNode(
                 currentOp.getHandlingNode());
             Operation op = qa.removeCurrentReadOp();
@@ -604,7 +604,7 @@ public class MemcachedConnection extends SpyThread {
 
   protected void queueReconnect(MemcachedNode qa) {
     if (!shutDown) {
-      getLogger().warn("Closing, and reopening %s, attempt %d.", qa,
+      getLogger().warn("Closing, and reopening {}, attempt {}.", qa,
           qa.getReconnectCount());
       if (qa.getSk() != null) {
         qa.getSk().cancel();
@@ -615,7 +615,7 @@ public class MemcachedConnection extends SpyThread {
         if (qa.getChannel() != null && qa.getChannel().socket() != null) {
           qa.getChannel().socket().close();
         } else {
-          getLogger().info("The channel or socket was null for %s", qa);
+          getLogger().info("The channel or socket was null for {}", qa);
         }
       } catch (IOException e) {
         getLogger().warn("IOException trying to close a socket", e);
@@ -687,19 +687,19 @@ public class MemcachedConnection extends SpyThread {
       try {
         if(!belongsToCluster(qa)) {
           getLogger().debug("Node does not belong to cluster anymore, "
-            + "skipping reconnect: %s", qa);
+            + "skipping reconnect: {}", qa);
           continue;
         }
         if (!seen.containsKey(qa)) {
           seen.put(qa, Boolean.TRUE);
-          getLogger().info("Reconnecting %s", qa);
+          getLogger().info("Reconnecting {}", qa);
           ch = SocketChannel.open();
           ch.configureBlocking(false);
           int ops = 0;
           if (ch.connect(qa.getSocketAddress())) {
             connected(qa);
             addedQueue.offer(qa);
-            getLogger().info("Immediately reconnected to %s", qa);
+            getLogger().info("Immediately reconnected to {}", qa);
             assert ch.isConnected();
           } else {
             ops = SelectionKey.OP_CONNECT;
@@ -707,13 +707,13 @@ public class MemcachedConnection extends SpyThread {
           qa.registerChannel(ch, ch.register(selector, ops, qa));
           assert qa.getChannel() == ch : "Channel was lost.";
         } else {
-          getLogger().debug("Skipping duplicate reconnect request for %s", qa);
+          getLogger().debug("Skipping duplicate reconnect request for {}", qa);
         }
       } catch (SocketException e) {
         getLogger().warn("Error on reconnect", e);
         rereQueue.add(qa);
       } catch (Exception e) {
-        getLogger().error("Exception on reconnect, lost node %s", qa, e);
+        getLogger().error("Exception on reconnect, lost node {}", qa, e);
       } finally {
         // it's possible that above code will leak file descriptors under
         // abnormal
@@ -723,7 +723,7 @@ public class MemcachedConnection extends SpyThread {
           try {
             ch.close();
           } catch (IOException x) {
-            getLogger().error("Exception closing channel: %s", qa, x);
+            getLogger().error("Exception closing channel: {}", qa, x);
           }
         }
       }
@@ -776,7 +776,7 @@ public class MemcachedConnection extends SpyThread {
         placeIn = primary;
         this.getLogger().warn(
             "Could not redistribute "
-                + "to another node, retrying primary node for %s.", key);
+                + "to another node, retrying primary node for {}.", key);
       }
     }
 
@@ -796,7 +796,7 @@ public class MemcachedConnection extends SpyThread {
     addedQueue.offer(node);
     Selector s = selector.wakeup();
     assert s == selector : "Wakeup returned the wrong selector.";
-    getLogger().debug("Added %s to %s", o, node);
+    getLogger().debug("Added {} to {}", o, node);
   }
 
   protected void addOperation(final MemcachedNode node, final Operation o) {
@@ -806,7 +806,7 @@ public class MemcachedConnection extends SpyThread {
     addedQueue.offer(node);
     Selector s = selector.wakeup();
     assert s == selector : "Wakeup returned the wrong selector.";
-    getLogger().debug("Added %s to %s", o, node);
+    getLogger().debug("Added {} to {}", o, node);
   }
 
   public void addOperations(final Map<MemcachedNode, Operation> ops) {
@@ -861,15 +861,15 @@ public class MemcachedConnection extends SpyThread {
         qa.getChannel().close();
         qa.setSk(null);
         if (qa.getBytesRemainingToWrite() > 0) {
-          getLogger().warn("Shut down with %d bytes remaining to write",
+          getLogger().warn("Shut down with {} bytes remaining to write",
               qa.getBytesRemainingToWrite());
         }
-        getLogger().debug("Shut down channel %s", qa.getChannel());
+        getLogger().debug("Shut down channel {}", qa.getChannel());
       }
     }
     running = false;
     selector.close();
-    getLogger().debug("Shut down selector %s", selector);
+    getLogger().debug("Shut down selector {}", selector);
   }
 
   @Override

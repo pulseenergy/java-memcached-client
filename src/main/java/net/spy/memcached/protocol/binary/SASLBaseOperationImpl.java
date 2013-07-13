@@ -78,7 +78,7 @@ public abstract class SASLBaseOperationImpl extends OperationImpl {
 
   @Override
   protected void decodePayload(byte[] pl) {
-    getLogger().debug("Auth response:  %s", new String(pl));
+    getLogger().debug("Auth response:  {}", new String(pl));
   }
 
   @Override

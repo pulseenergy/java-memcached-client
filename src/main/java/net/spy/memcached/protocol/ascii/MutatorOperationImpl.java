@@ -58,7 +58,7 @@ final class MutatorOperationImpl extends OperationImpl implements
 
   @Override
   public void handleLine(String line) {
-    getLogger().debug("Result:  %s", line);
+    getLogger().debug("Result:  {}", line);
     OperationStatus found = null;
     if (line.equals("NOT_FOUND")) {
       found = NOT_FOUND;

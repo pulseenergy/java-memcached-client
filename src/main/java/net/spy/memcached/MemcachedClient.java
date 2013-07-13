@@ -1584,7 +1584,7 @@ public class MemcachedClient extends SpyObject implements MemcachedClientIF,
           @SuppressWarnings("synthetic-access")
           public void receivedStatus(OperationStatus status) {
             if (!status.isSuccess()) {
-              getLogger().warn("Unsuccessful stat fetch: %s", status);
+              getLogger().warn("Unsuccessful stat fetch: {}", status);
             }
           }
 
@@ -1626,7 +1626,7 @@ public class MemcachedClient extends SpyObject implements MemcachedClientIF,
     } catch (InterruptedException e) {
       throw new RuntimeException("Interrupted", e);
     }
-    getLogger().debug("Mutation returned %s", rv);
+    getLogger().debug("Mutation returned {}", rv);
     return rv.get();
   }
 

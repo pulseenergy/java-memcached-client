@@ -118,7 +118,7 @@ class MultiGetOperationImpl extends MultiKeyOperationImpl implements
       getCallback().receivedStatus(STATUS_OK);
       transitionState(OperationState.COMPLETE);
     } else if (errorCode != 0) {
-      getLogger().warn("Error on key %s:  %s (%d)", keys.get(responseOpaque),
+      getLogger().warn("Error on key {}:  {} ({})", keys.get(responseOpaque),
           new String(pl), errorCode);
     } else {
       final int flags = decodeInt(pl, 0);

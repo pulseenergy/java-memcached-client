@@ -129,7 +129,7 @@ public abstract class BaseOperationImpl extends SpyObject implements Operation {
    * Transition the state of this operation to the given state.
    */
   protected final synchronized void transitionState(OperationState newState) {
-    getLogger().debug("Transitioned state from %s to %s", state, newState);
+    getLogger().debug("Transitioned state from {} to {}", state, newState);
     state = newState;
     // Discard our buffer when we no longer need it.
     if(state != OperationState.WRITE_QUEUED
@@ -155,7 +155,7 @@ public abstract class BaseOperationImpl extends SpyObject implements Operation {
 
   protected void handleError(OperationErrorType eType, String line)
     throws IOException {
-    getLogger().error("Error:  %s", line);
+    getLogger().error("Error:  {}", line);
     switch (eType) {
     case GENERAL:
       exception = new OperationException();

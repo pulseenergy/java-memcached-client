@@ -124,7 +124,7 @@ abstract class OperationImpl extends BaseOperationImpl implements Operation {
       int toRead = MIN_RECV_PACKET - headerOffset;
       int available = b.remaining();
       toRead = Math.min(toRead, available);
-      getLogger().debug("Reading %d header bytes", toRead);
+      getLogger().debug("Reading {} header bytes", toRead);
       b.get(header, headerOffset, toRead);
       headerOffset += toRead;
 
@@ -153,7 +153,7 @@ abstract class OperationImpl extends BaseOperationImpl implements Operation {
       int toRead = payload.length - payloadOffset;
       int available = b.remaining();
       toRead = Math.min(toRead, available);
-      getLogger().debug("Reading %d payload bytes", toRead);
+      getLogger().debug("Reading {} payload bytes", toRead);
       b.get(payload, payloadOffset, toRead);
       payloadOffset += toRead;
 
@@ -163,7 +163,7 @@ abstract class OperationImpl extends BaseOperationImpl implements Operation {
       }
     } else {
       // Haven't read enough to make up a payload. Must read more.
-      getLogger().debug("Only read %d of the %d needed to fill a header",
+      getLogger().debug("Only read {} of the {} needed to fill a header",
           headerOffset, MIN_RECV_PACKET);
     }
 
@@ -240,7 +240,7 @@ abstract class OperationImpl extends BaseOperationImpl implements Operation {
    */
   protected boolean opaqueIsValid() {
     if (responseOpaque != opaque) {
-      getLogger().warn("Expected opaque:  %d, got opaque:  %d\n",
+      getLogger().warn("Expected opaque:  {}, got opaque:  {}\n",
           responseOpaque, opaque);
     }
     return responseOpaque == opaque;

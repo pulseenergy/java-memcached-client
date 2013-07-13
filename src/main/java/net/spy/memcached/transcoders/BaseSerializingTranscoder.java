@@ -131,10 +131,10 @@ public abstract class BaseSerializingTranscoder extends SpyObject {
         bis.close();
       }
     } catch (IOException e) {
-      getLogger().warn("Caught IOException decoding %d bytes of data",
+      getLogger().warn("Caught IOException decoding {} bytes of data",
           in == null ? 0 : in.length, e);
     } catch (ClassNotFoundException e) {
-      getLogger().warn("Caught CNFE decoding %d bytes of data",
+      getLogger().warn("Caught CNFE decoding {} bytes of data",
           in == null ? 0 : in.length, e);
     } finally {
       CloseUtil.close(is);
@@ -162,7 +162,7 @@ public abstract class BaseSerializingTranscoder extends SpyObject {
       CloseUtil.close(bos);
     }
     byte[] rv = bos.toByteArray();
-    getLogger().debug("Compressed %d bytes to %d", in.length, rv.length);
+    getLogger().debug("Compressed {} bytes to {}", in.length, rv.length);
     return rv;
   }
 
