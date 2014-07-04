@@ -1,6 +1,6 @@
 /**
  * Copyright (C) 2006-2009 Dustin Sallings
- * Copyright (C) 2009-2012 Couchbase, Inc.
+ * Copyright (C) 2009-2013 Couchbase, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,16 +26,17 @@ package net.spy.memcached.internal;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import net.spy.memcached.MemcachedConnection;
-import net.spy.memcached.compat.SpyObject;
 import net.spy.memcached.ops.Operation;
 import net.spy.memcached.ops.OperationState;
 import net.spy.memcached.ops.OperationStatus;
+import net.spy.memcached.ops.StatusCode;
 
 /**
  * Managed future for operations.
@@ -50,7 +51,9 @@ import net.spy.memcached.ops.OperationStatus;
  *
  * @param <T> Type of object returned from this future.
  */
-public class OperationFuture<T> extends SpyObject implements Future<T> {
+public class OperationFuture<T>
+  extends AbstractListenableFuture<T, OperationCompletionListener>
+  implements Future<T> {
 
   private final CountDownLatch latch;
   private final AtomicReference<T> objRef;
@@ -69,8 +72,9 @@ public class OperationFuture<T> extends SpyObject implements Future<T> {
    * @param l the latch to be used counting down the OperationFuture
    * @param opTimeout the timeout within which the operation needs to be done
    */
-  public OperationFuture(String k, CountDownLatch l, long opTimeout) {
-    this(k, l, new AtomicReference<T>(null), opTimeout);
+  public OperationFuture(String k, CountDownLatch l, long opTimeout,
+    ExecutorService service) {
+    this(k, l, new AtomicReference<T>(null), opTimeout, service);
   }
 
   /**
@@ -84,8 +88,9 @@ public class OperationFuture<T> extends SpyObject implements Future<T> {
    * @param opTimeout the timeout within which the operation needs to be done
    */
   public OperationFuture(String k, CountDownLatch l, AtomicReference<T> oref,
-      long opTimeout) {
-    super();
+      long opTimeout, ExecutorService service) {
+    super(service);
+
     latch = l;
     objRef = oref;
     status = null;
@@ -104,6 +109,7 @@ public class OperationFuture<T> extends SpyObject implements Future<T> {
   public boolean cancel(boolean ign) {
     assert op != null : "No operation";
     op.cancel();
+    notifyListeners();
     return op.getState() == OperationState.WRITE_QUEUED;
   }
 
@@ -115,6 +121,7 @@ public class OperationFuture<T> extends SpyObject implements Future<T> {
   public boolean cancel() {
     assert op != null : "No operation";
     op.cancel();
+    notifyListeners();
     return op.getState() == OperationState.WRITE_QUEUED;
   }
 
@@ -210,7 +217,7 @@ public class OperationFuture<T> extends SpyObject implements Future<T> {
       try {
         get();
       } catch (InterruptedException e) {
-        status = new OperationStatus(false, "Interrupted");
+        status = new OperationStatus(false, "Interrupted", StatusCode.INTERRUPTED);
         Thread.currentThread().isInterrupted();
       } catch (ExecutionException e) {
         getLogger().warn("Error getting cas of operation", e);
@@ -235,7 +242,7 @@ public class OperationFuture<T> extends SpyObject implements Future<T> {
       try {
         get();
       } catch (InterruptedException e) {
-        status = new OperationStatus(false, "Interrupted");
+        status = new OperationStatus(false, "Interrupted", StatusCode.INTERRUPTED);
         Thread.currentThread().isInterrupted();
       } catch (ExecutionException e) {
         getLogger().warn("Error getting status of operation", e);
@@ -298,4 +305,25 @@ public class OperationFuture<T> extends SpyObject implements Future<T> {
     return latch.getCount() == 0 || op.isCancelled()
         || op.getState() == OperationState.COMPLETE;
   }
+
+  @Override
+  public OperationFuture<T> addListener(OperationCompletionListener listener) {
+    super.addToListeners((GenericCompletionListener) listener);
+    return this;
+  }
+
+  @Override
+  public OperationFuture<T> removeListener(
+    OperationCompletionListener listener) {
+    super.removeFromListeners((GenericCompletionListener) listener);
+    return this;
+  }
+
+  /**
+   * Signals that this future is complete.
+   */
+  public void signalComplete() {
+    notifyListeners();
+  }
+
 }

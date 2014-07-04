@@ -1,6 +1,6 @@
 /**
  * Copyright (C) 2006-2009 Dustin Sallings
- * Copyright (C) 2009-2011 Couchbase, Inc.
+ * Copyright (C) 2009-2013 Couchbase, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -23,6 +23,27 @@
 
 package net.spy.memcached;
 
+import net.spy.memcached.compat.SpyThread;
+import net.spy.memcached.internal.OperationFuture;
+import net.spy.memcached.metrics.MetricCollector;
+import net.spy.memcached.metrics.MetricType;
+import net.spy.memcached.ops.GetOperation;
+import net.spy.memcached.ops.KeyedOperation;
+import net.spy.memcached.ops.NoopOperation;
+import net.spy.memcached.ops.Operation;
+import net.spy.memcached.ops.OperationCallback;
+import net.spy.memcached.ops.OperationException;
+import net.spy.memcached.ops.OperationState;
+import net.spy.memcached.ops.OperationStatus;
+import net.spy.memcached.ops.TapOperation;
+import net.spy.memcached.ops.VBucketAware;
+import net.spy.memcached.protocol.binary.BinaryOperationFactory;
+import net.spy.memcached.protocol.binary.MultiGetOperationImpl;
+import net.spy.memcached.protocol.binary.TapAckOperationImpl;
+import net.spy.memcached.util.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
@@ -38,99 +59,213 @@ import java.nio.channels.SocketChannel;
 import java.text.MessageFormat;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.ConcurrentModificationException;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
-import net.spy.memcached.compat.SpyThread;
-import net.spy.memcached.internal.OperationFuture;
-import net.spy.memcached.ops.KeyedOperation;
-import net.spy.memcached.ops.NoopOperation;
-import net.spy.memcached.ops.Operation;
-import net.spy.memcached.ops.OperationCallback;
-import net.spy.memcached.ops.OperationException;
-import net.spy.memcached.ops.OperationState;
-import net.spy.memcached.ops.OperationStatus;
-import net.spy.memcached.ops.TapOperation;
-import net.spy.memcached.ops.VBucketAware;
-import net.spy.memcached.protocol.binary.BinaryOperationFactory;
-import net.spy.memcached.protocol.binary.TapAckOperationImpl;
-import net.spy.memcached.util.StringUtils;
-import org.slf4j.LoggerFactory;
 
 /**
- * Connection to a cluster of memcached servers.
+ * Main class for handling connections to a memcached cluster.
  */
 public class MemcachedConnection extends SpyThread {
 
-  // The number of empty selects we'll allow before assuming we may have
-  // missed one and should check the current selectors. This generally
-  // indicates a bug, but we'll check it nonetheless.
+  /**
+   * The number of empty selects we'll allow before assuming we may have
+   * missed one and should check the current selectors. This generally
+   * indicates a bug, but we'll check it nonetheless.
+   */
   private static final int DOUBLE_CHECK_EMPTY = 256;
-  // The number of empty selects we'll allow before blowing up. It's too
-  // easy to write a bug that causes it to loop uncontrollably. This helps
-  // find those bugs and often works around them.
+
+  /**
+   * The number of empty selects we'll allow before blowing up. It's too
+   * easy to write a bug that causes it to loop uncontrollably. This helps
+   * find those bugs and often works around them.
+   */
   private static final int EXCESSIVE_EMPTY = 0x1000000;
 
+  /**
+   * The default wakeup delay if not overriden by a system property.
+   */
+  private static final int DEFAULT_WAKEUP_DELAY = 1000;
+
+  /**
+   * If an operation gets cloned more than this ceiling, cancel it for
+   * safety reasons.
+   */
+  private static final int MAX_CLONE_COUNT = 100;
+
+  private static final String RECON_QUEUE_METRIC =
+    "[MEM] Reconnecting Nodes (ReconnectQueue)";
+  private static final String SHUTD_QUEUE_METRIC =
+    "[MEM] Shutting Down Nodes (NodesToShutdown)";
+  private static final String OVERALL_REQUEST_METRIC =
+    "[MEM] Request Rate: All";
+  private static final String OVERALL_AVG_BYTES_WRITE_METRIC =
+    "[MEM] Average Bytes written to OS per write";
+  private static final String OVERALL_AVG_BYTES_READ_METRIC =
+    "[MEM] Average Bytes read from OS per read";
+  private static final String OVERALL_AVG_TIME_ON_WIRE_METRIC =
+    "[MEM] Average Time on wire for operations (µs)";
+  private static final String OVERALL_RESPONSE_METRIC =
+    "[MEM] Response Rate: All (Failure + Success + Retry)";
+  private static final String OVERALL_RESPONSE_RETRY_METRIC =
+    "[MEM] Response Rate: Retry";
+  private static final String OVERALL_RESPONSE_FAIL_METRIC =
+    "[MEM] Response Rate: Failure";
+  private static final String OVERALL_RESPONSE_SUCC_METRIC =
+    "[MEM] Response Rate: Success";
+
+  /**
+   * If the connection is alread shut down or shutting down.
+   */
   protected volatile boolean shutDown = false;
-  // If true, optimization will collapse multiple sequential get ops
+
+  /**
+   * If true, optimization will collapse multiple sequential get ops.
+   */
   private final boolean shouldOptimize;
+
+  /**
+   * Holds the current {@link Selector} to use.
+   */
   protected Selector selector = null;
+
+  /**
+   * The {@link NodeLocator} to use for this connection.
+   */
   protected final NodeLocator locator;
+
+  /**
+   * The configured {@link FailureMode}.
+   */
   protected final FailureMode failureMode;
-  // maximum amount of time to wait between reconnect attempts
+
+  /**
+   * Maximum amount of time to wait between reconnect attempts.
+   */
   private final long maxDelay;
+
+  /**
+   * Contains the current number of empty select() calls, which could indicate
+   * bugs.
+   */
   private int emptySelects = 0;
+
+  /**
+   * The buffer size that will be used when reading from the server.
+   */
   private final int bufSize;
+
+  /**
+   * The connection factory to create {@link MemcachedNode}s from.
+   */
   private final ConnectionFactory connectionFactory;
-  // AddedQueue is used to track the QueueAttachments for which operations
-  // have recently been queued.
+
+  /**
+   * AddedQueue is used to track the QueueAttachments for which operations
+   * have recently been queued.
+   */
   protected final ConcurrentLinkedQueue<MemcachedNode> addedQueue;
-  // reconnectQueue contains the attachments that need to be reconnected
-  // The key is the time at which they are eligible for reconnect
+
+  /**
+   * reconnectQueue contains the attachments that need to be reconnected.
+   * The key is the time at which they are eligible for reconnect.
+   */
   private final SortedMap<Long, MemcachedNode> reconnectQueue;
 
+  /**
+   * True if not shutting down or shut down.
+   */
   protected volatile boolean running = true;
 
+  /**
+   * Holds all connection observers that get notified on connection status
+   * changes.
+   */
   private final Collection<ConnectionObserver> connObservers =
-      new ConcurrentLinkedQueue<ConnectionObserver>();
+    new ConcurrentLinkedQueue<ConnectionObserver>();
+
+  /**
+   * The {@link OperationFactory} to clone or create operations.
+   */
   private final OperationFactory opFact;
+
+  /**
+   * The threshold for timeout exceptions.
+   */
   private final int timeoutExceptionThreshold;
-  private final Collection<Operation> retryOps;
+
+  /**
+   * Holds operations that need to be retried.
+   */
+  private final List<Operation> retryOps;
+
+  /**
+   * Holds all nodes that are scheduled for shutdown.
+   */
   protected final ConcurrentLinkedQueue<MemcachedNode> nodesToShutdown;
+
+  /**
+   * If set to true, a proper check after finish connecting is done to see
+   * if the node is not responding but really alive.
+   */
   private final boolean verifyAliveOnConnect;
 
   /**
-   * Construct a memcached connection.
+   * The {@link ExecutorService} to use for callbacks.
+   */
+  private final ExecutorService listenerExecutorService;
+
+  /**
+   * The {@link MetricCollector} to accumulate metrics (or dummy).
+   */
+  protected final MetricCollector metrics;
+
+  /**
+   * The current type of metrics to collect.
+   */
+  protected final MetricType metricType;
+
+  /**
+   * The selector wakeup delay, defaults to 1000ms.
+   */
+  private final int wakeupDelay;
+
+  /**
+   * Construct a {@link MemcachedConnection}.
    *
-   * @param bufSize the size of the buffer used for reading from the server
-   * @param f the factory that will provide an operation queue
-   * @param a the addresses of the servers to connect to
-   *
+   * @param bufSize the size of the buffer used for reading from the server.
+   * @param f the factory that will provide an operation queue.
+   * @param a the addresses of the servers to connect to.
+   * @param obs the initial observers to add.
+   * @param fm the failure mode to use.
+   * @param opfactory the operation factory.
    * @throws IOException if a connection attempt fails early
    */
-  public MemcachedConnection(int bufSize, ConnectionFactory f,
-      List<InetSocketAddress> a, Collection<ConnectionObserver> obs,
-      FailureMode fm, OperationFactory opfactory) throws IOException {
+  public MemcachedConnection(final int bufSize, final ConnectionFactory f,
+      final List<InetSocketAddress> a, final Collection<ConnectionObserver> obs,
+      final FailureMode fm, final OperationFactory opfactory) throws IOException {
     connObservers.addAll(obs);
     reconnectQueue = new TreeMap<Long, MemcachedNode>();
     addedQueue = new ConcurrentLinkedQueue<MemcachedNode>();
     failureMode = fm;
     shouldOptimize = f.shouldOptimize();
-    maxDelay = f.getMaxReconnectDelay();
+    maxDelay = TimeUnit.SECONDS.toMillis(f.getMaxReconnectDelay());
     opFact = opfactory;
     timeoutExceptionThreshold = f.getTimeoutExceptionThreshold();
     selector = Selector.open();
-    retryOps = new ArrayList<Operation>();
+    retryOps = Collections.synchronizedList(new ArrayList<Operation>());
     nodesToShutdown = new ConcurrentLinkedQueue<MemcachedNode>();
+    listenerExecutorService = f.getListenerExecutorService();
     this.bufSize = bufSize;
     this.connectionFactory = f;
 
@@ -141,25 +276,67 @@ public class MemcachedConnection extends SpyThread {
       verifyAliveOnConnect = false;
     }
 
+    wakeupDelay = Integer.parseInt( System.getProperty("net.spy.wakeupDelay",
+      Integer.toString(DEFAULT_WAKEUP_DELAY)));
+
     List<MemcachedNode> connections = createConnections(a);
     locator = f.createLocator(connections);
+
+    metrics = f.getMetricCollector();
+    metricType = f.enableMetrics();
+
+    registerMetrics();
+
     setName("Memcached IO over " + this);
     setDaemon(f.isDaemon());
     start();
   }
 
+  /**
+   * Register Metrics for collection.
+   *
+   * Note that these Metrics may or may not take effect, depending on the
+   * {@link MetricCollector} implementation. This can be controlled from
+   * the {@link DefaultConnectionFactory}.
+   */
+  protected void registerMetrics() {
+    if (metricType.equals(MetricType.DEBUG)
+      || metricType.equals(MetricType.PERFORMANCE)) {
+      metrics.addHistogram(OVERALL_AVG_BYTES_READ_METRIC);
+      metrics.addHistogram(OVERALL_AVG_BYTES_WRITE_METRIC);
+      metrics.addHistogram(OVERALL_AVG_TIME_ON_WIRE_METRIC);
+      metrics.addMeter(OVERALL_RESPONSE_METRIC);
+      metrics.addMeter(OVERALL_REQUEST_METRIC);
+
+      if (metricType.equals(MetricType.DEBUG)) {
+        metrics.addCounter(RECON_QUEUE_METRIC);
+        metrics.addCounter(SHUTD_QUEUE_METRIC);
+        metrics.addMeter(OVERALL_RESPONSE_RETRY_METRIC);
+        metrics.addMeter(OVERALL_RESPONSE_SUCC_METRIC);
+        metrics.addMeter(OVERALL_RESPONSE_FAIL_METRIC);
+      }
+    }
+  }
+
+  /**
+   * Create connections for the given list of addresses.
+   *
+   * @param addrs the list of addresses to connect to.
+   * @return addrs list of {@link MemcachedNode}s.
+   * @throws IOException if connecting was not successful.
+   */
   protected List<MemcachedNode> createConnections(
-      final Collection<InetSocketAddress> a) throws IOException {
-    List<MemcachedNode> connections = new ArrayList<MemcachedNode>(a.size());
-    for (SocketAddress sa : a) {
+    final Collection<InetSocketAddress> addrs) throws IOException {
+    List<MemcachedNode> connections = new ArrayList<MemcachedNode>(addrs.size());
+
+    for (SocketAddress sa : addrs) {
       SocketChannel ch = SocketChannel.open();
       ch.configureBlocking(false);
-      MemcachedNode qa =
-          this.connectionFactory.createMemcachedNode(sa, ch, bufSize);
+      MemcachedNode qa = connectionFactory.createMemcachedNode(sa, ch, bufSize);
+      qa.setConnection(this);
       int ops = 0;
-      ch.socket().setTcpNoDelay(!this.connectionFactory.useNagleAlgorithm());
-      // Initially I had attempted to skirt this by queueing every
-      // connect, but it considerably slowed down start time.
+      ch.socket().setTcpNoDelay(!connectionFactory.useNagleAlgorithm());
+
       try {
         if (ch.connect(sa)) {
           getLogger().info("Connected to {} immediately", qa);
@@ -171,7 +348,6 @@ public class MemcachedConnection extends SpyThread {
 
         selector.wakeup();
         qa.setSk(ch.register(selector, ops, qa));
-
         assert ch.isConnected()
             || qa.getSk().interestOps() == SelectionKey.OP_CONNECT
             : "Not connected, and not wanting to connect";
@@ -181,9 +357,15 @@ public class MemcachedConnection extends SpyThread {
       }
       connections.add(qa);
     }
+
     return connections;
   }
 
+  /**
+   * Make sure that the current selectors make sense.
+   *
+   * @return true if they do.
+   */
   private boolean selectorsMakeSense() {
     for (MemcachedNode qa : locator.getAll()) {
       if (qa.getSk() != null && qa.getSk().isValid()) {
@@ -200,7 +382,7 @@ public class MemcachedConnection extends SpyThread {
             expected |= SelectionKey.OP_WRITE;
           }
           assert sops == expected : "Invalid ops:  " + qa + ", expected "
-              + expected + ", got " + sops;
+            + expected + ", got " + sops;
         } else {
           int sops = qa.getSk().interestOps();
           assert sops == SelectionKey.OP_CONNECT
@@ -213,19 +395,21 @@ public class MemcachedConnection extends SpyThread {
   }
 
   /**
-   * MemcachedClient calls this method to handle IO over the connections.
+   * Handle all IO that flows through the connection.
+   *
+   * This method is called in an endless loop, listens on NIO selectors and
+   * dispatches the underlying read/write calls if needed.
    */
   public void handleIO() throws IOException {
     if (shutDown) {
-      throw new IOException("No IO while shut down");
+      getLogger().debug("No IO while shut down.");
+      return;
     }
 
-    // Deal with all of the stuff that's been added, but may not be marked
-    // writable.
     handleInputQueue();
     getLogger().debug("Done dealing with queue.");
 
-    long delay = 0;
+    long delay = 1000;
     if (!reconnectQueue.isEmpty()) {
       long now = System.currentTimeMillis();
       long then = reconnectQueue.firstKey();
@@ -234,38 +418,122 @@ public class MemcachedConnection extends SpyThread {
     getLogger().debug("Selecting with delay of {}ms", delay);
     assert selectorsMakeSense() : "Selectors don't make sense.";
     int selected = selector.select(delay);
-    Set<SelectionKey> selectedKeys = selector.selectedKeys();
 
-    if (selectedKeys.isEmpty() && !shutDown) {
-      getLogger().debug("No selectors ready, interrupted: "
-          + Thread.interrupted());
-      if (++emptySelects > DOUBLE_CHECK_EMPTY) {
-        for (SelectionKey sk : selector.keys()) {
-          getLogger().debug("{} has {}, interested in {}", sk, sk.readyOps(),
-              sk.interestOps());
-          if (sk.readyOps() != 0) {
-            getLogger().debug("{} has a ready op, handling IO", sk);
-            handleIO(sk);
-          } else {
-            lostConnection((MemcachedNode) sk.attachment());
-          }
-        }
-        assert emptySelects < EXCESSIVE_EMPTY : "Too many empty selects";
-      }
+    if (shutDown) {
+      return;
+    } else if (selected == 0 && addedQueue.isEmpty()) {
+      handleWokenUpSelector();
+    } else if (selector.selectedKeys().isEmpty()) {
+      handleEmptySelects();
     } else {
       getLogger().debug("Selected {}, selected {} keys", selected,
-          selectedKeys.size());
+        selector.selectedKeys().size());
       emptySelects = 0;
 
-      for (SelectionKey sk : selectedKeys) {
+      Iterator<SelectionKey> iterator = selector.selectedKeys().iterator();
+      while(iterator.hasNext()) {
+        SelectionKey sk = iterator.next();
         handleIO(sk);
+        iterator.remove();
       }
-      selectedKeys.clear();
     }
 
-    // see if any connections blew up with large number of timeouts
+    handleOperationalTasks();
+  }
+
+  /**
+   * Helper method which gets called if the selector is woken up because of the
+   * timeout setting, if has been interrupted or if happens during regular
+   * write operation phases.
+   *
+   * <p>This method can be overriden by child implementations to handle custom
+   * behavior on a manually woken selector, like sending pings through the
+   * channels to make sure they are alive.</p>
+   *
+   * <p>Note that there is no guarantee that this method is at all or in the
+   * regular interval called, so all overriding implementations need to take
+   * that into account. Also, it needs to take into account that it may be
+   * called very often under heavy workloads, so it should not perform extensive
+   * tasks in the same thread.</p>
+   */
+  protected void handleWokenUpSelector() { }
+
+  /**
+   * Helper method for {@link #handleIO()} to encapsulate everything that
+   * needs to be checked on a regular basis that has nothing to do directly
+   * with reading and writing data.
+   *
+   * @throws IOException if an error happens during shutdown queue handling.
+   */
+  private void handleOperationalTasks() throws IOException {
+    checkPotentiallyTimedOutConnection();
+
+    if (!shutDown && !reconnectQueue.isEmpty()) {
+      attemptReconnects();
+    }
+
+    if (!retryOps.isEmpty()) {
+      ArrayList<Operation> operations = new ArrayList<Operation>(retryOps);
+      retryOps.clear();
+      redistributeOperations(operations);
+    }
+
+    handleShutdownQueue();
+  }
+
+  /**
+   * Helper method for {@link #handleIO()} to handle empty select calls.
+   */
+  private void handleEmptySelects() {
+    getLogger().debug("No selectors ready, interrupted: "
+      + Thread.interrupted());
+
+    if (++emptySelects > DOUBLE_CHECK_EMPTY) {
+      for (SelectionKey sk : selector.keys()) {
+        getLogger().debug("{} has {}, interested in {}", sk, sk.readyOps(),
+          sk.interestOps());
+        if (sk.readyOps() != 0) {
+          getLogger().debug("{} has a ready op, handling IO", sk);
+          handleIO(sk);
+        } else {
+          lostConnection((MemcachedNode) sk.attachment());
+        }
+      }
+      assert emptySelects < EXCESSIVE_EMPTY : "Too many empty selects";
+    }
+  }
+
+  /**
+   * Check if nodes need to be shut down and do so if needed.
+   *
+   * @throws IOException if the channel could not be closed properly.
+   */
+  private void handleShutdownQueue() throws IOException {
+    for (MemcachedNode qa : nodesToShutdown) {
+      if (!addedQueue.contains(qa)) {
+        nodesToShutdown.remove(qa);
+        metrics.decrementCounter(SHUTD_QUEUE_METRIC);
+        Collection<Operation> notCompletedOperations = qa.destroyInputQueue();
+        if (qa.getChannel() != null) {
+          qa.getChannel().close();
+          qa.setSk(null);
+          if (qa.getBytesRemainingToWrite() > 0) {
+            getLogger().warn("Shut down with {} bytes remaining to write",
+              qa.getBytesRemainingToWrite());
+          }
+          getLogger().debug("Shut down channel {}", qa.getChannel());
+        }
+        redistributeOperations(notCompletedOperations);
+      }
+    }
+  }
+
+  /**
+   * Check if one or more nodes exceeded the timeout Threshold.
+   */
+  private void checkPotentiallyTimedOutConnection() {
     boolean stillCheckingTimeouts = true;
-    while(stillCheckingTimeouts) {
+    while (stillCheckingTimeouts) {
       try {
         for (SelectionKey sk : selector.keys()) {
           MemcachedNode mn = (MemcachedNode) sk.attachment();
@@ -281,70 +549,44 @@ public class MemcachedConnection extends SpyThread {
         continue;
       }
     }
-
-    if (!shutDown && !reconnectQueue.isEmpty()) {
-      attemptReconnects();
-    }
-    // rehash any operations that are in retry state
-    redistributeOperations(retryOps);
-    retryOps.clear();
-
-    // try to shutdown odd nodes
-    for (MemcachedNode qa : nodesToShutdown) {
-      if (!addedQueue.contains(qa)) {
-        nodesToShutdown.remove(qa);
-        Collection<Operation> notCompletedOperations = qa.destroyInputQueue();
-        if (qa.getChannel() != null) {
-          qa.getChannel().close();
-          qa.setSk(null);
-          if (qa.getBytesRemainingToWrite() > 0) {
-            getLogger().warn("Shut down with {} bytes remaining to write",
-                qa.getBytesRemainingToWrite());
-          }
-          getLogger().debug("Shut down channel {}", qa.getChannel());
-        }
-        redistributeOperations(notCompletedOperations);
-      }
-    }
   }
 
-  // Handle any requests that have been made against the client.
+  /**
+   * Handle any requests that have been made against the client.
+   */
   private void handleInputQueue() {
     if (!addedQueue.isEmpty()) {
       getLogger().debug("Handling queue");
-      // If there's stuff in the added queue. Try to process it.
       Collection<MemcachedNode> toAdd = new HashSet<MemcachedNode>();
-      // Transfer the queue into a hashset. There are very likely more
-      // additions than there are nodes.
       Collection<MemcachedNode> todo = new HashSet<MemcachedNode>();
-      MemcachedNode qaNode = null;
+
+      MemcachedNode qaNode;
       while ((qaNode = addedQueue.poll()) != null) {
         todo.add(qaNode);
       }
 
-      // Now process the queue.
-      for (MemcachedNode qa : todo) {
+      for (MemcachedNode node : todo) {
         boolean readyForIO = false;
-        if (qa.isActive()) {
-          if (qa.getCurrentWriteOp() != null) {
+        if (node.isActive()) {
+          if (node.getCurrentWriteOp() != null) {
             readyForIO = true;
-            getLogger().debug("Handling queued write {}", qa);
+            getLogger().debug("Handling queued write {}", node);
           }
         } else {
-          toAdd.add(qa);
+          toAdd.add(node);
         }
-        qa.copyInputQueue();
+        node.copyInputQueue();
         if (readyForIO) {
           try {
-            if (qa.getWbuf().hasRemaining()) {
-              handleWrites(qa.getSk(), qa);
+            if (node.getWbuf().hasRemaining()) {
+              handleWrites(node);
             }
           } catch (IOException e) {
             getLogger().warn("Exception handling write", e);
-            lostConnection(qa);
+            lostConnection(node);
           }
         }
-        qa.fixupOps();
+        node.fixupOps();
       }
       addedQueue.addAll(toAdd);
     }
@@ -353,45 +595,55 @@ public class MemcachedConnection extends SpyThread {
   /**
    * Add a connection observer.
    *
-   * @return whether the observer was successfully added
+   * @return whether the observer was successfully added.
    */
-  public boolean addObserver(ConnectionObserver obs) {
+  public boolean addObserver(final ConnectionObserver obs) {
     return connObservers.add(obs);
   }
 
   /**
    * Remove a connection observer.
    *
-   * @return true if the observer existed and now doesn't
+   * @return true if the observer existed and now doesn't.
    */
-  public boolean removeObserver(ConnectionObserver obs) {
+  public boolean removeObserver(final ConnectionObserver obs) {
     return connObservers.remove(obs);
   }
 
-  private void connected(MemcachedNode node) {
+  /**
+   * Indicate a successful connect to the given node.
+   *
+   * @param node the node which was successfully connected.
+   */
+  private void connected(final MemcachedNode node) {
     assert node.getChannel().isConnected() : "Not connected.";
     int rt = node.getReconnectCount();
     node.connected();
+
     for (ConnectionObserver observer : connObservers) {
       observer.connectionEstablished(node.getSocketAddress(), rt);
     }
   }
 
-  private void lostConnection(MemcachedNode qa) {
-    queueReconnect(qa);
+  /**
+   * Indicate a lost connection to the given node.
+   *
+   * @param node the node where the connection was lost.
+   */
+  private void lostConnection(final MemcachedNode node) {
+    queueReconnect(node);
     for (ConnectionObserver observer : connObservers) {
-      observer.connectionLost(qa.getSocketAddress());
+      observer.connectionLost(node.getSocketAddress());
     }
   }
 
   /**
-   * Makes sure that the given SelectionKey belongs to the current
-   * cluster.
+   * Makes sure that the given node belongs to the current cluster.
    *
-   * Before trying to connect to a node, make sure it actually
-   * belongs to the currently connected cluster.
+   * Before trying to connect to a node, make sure it actually belongs to the
+   * currently connected cluster.
    */
-  boolean belongsToCluster(MemcachedNode node) {
+  boolean belongsToCluster(final MemcachedNode node) {
     for (MemcachedNode n : locator.getAll()) {
       if (n.getSocketAddress().equals(node.getSocketAddress())) {
         return true;
@@ -401,157 +653,176 @@ public class MemcachedConnection extends SpyThread {
   }
 
   /**
-   * Handle IO for a specific selector. Any IOException will cause a
-   * reconnect.
+   * Handle IO for a specific selector.
    *
-   * Note that this code makes sure that the corresponding node is not only
-   * able to connect, but also able to respond in a correct fashion. This is
-   * handled by issuing a dummy version/noop call and making sure it returns in
-   * a correct and timely fashion.
+   * Any IOException will cause a reconnect. Note that this code makes sure
+   * that the corresponding node is not only able to connect, but also able to
+   * respond in a correct fashion (if verifyAliveOnConnect is set to true
+   * through a property). This is handled by issuing a dummy
+   * version/noop call and making sure it returns in a correct and timely
+   * fashion.
    *
    * @param sk the selector to handle IO against.
    */
-  private void handleIO(SelectionKey sk) {
+  private void handleIO(final SelectionKey sk) {
     MemcachedNode node = (MemcachedNode) sk.attachment();
+
     try {
       getLogger().debug("Handling IO for:  {} (r={}, w={}, c={}, op={})", sk,
-              sk.isReadable(), sk.isWritable(), sk.isConnectable(),
-              sk.attachment());
+        sk.isReadable(), sk.isWritable(), sk.isConnectable(),
+        sk.attachment());
       if (sk.isConnectable() && belongsToCluster(node)) {
-        getLogger().info("Connection state changed for {}", sk);
+        getLogger().debug("Connection state changed for {}", sk);
         final SocketChannel channel = node.getChannel();
         if (channel.finishConnect()) {
-
-          if(verifyAliveOnConnect) {
-            // Test to see if it's truly alive, could be a hung process, OS
-            final CountDownLatch latch = new CountDownLatch(1);
-            final OperationFuture<Boolean> rv =
-              new OperationFuture<Boolean>("noop", latch, 2500);
-            NoopOperation testOp = opFact.noop(new OperationCallback() {
-              public void receivedStatus(OperationStatus status) {
-                rv.set(status.isSuccess(), status);
-              }
-
-              @Override
-              public void complete() {
-                latch.countDown();
-              }
-            });
-
-            testOp.setHandlingNode(node);
-            testOp.initialize();
-
-            checkState();
-            insertOperation(node, testOp);
-            node.copyInputQueue();
-
-            boolean done = false;
-            if(sk.isValid()) {
-              long timeout = TimeUnit.MILLISECONDS.toNanos(
-                connectionFactory.getOperationTimeout());
-              for(long stop = System.nanoTime() + timeout;
-                stop > System.nanoTime();) {
-                handleWrites(sk, node);
-                handleReads(sk, node);
-                if(done = (latch.getCount() == 0)) {
-                  break;
-                }
-              }
-            }
-
-            if (!done || testOp.isCancelled() || testOp.hasErrored()
-              || testOp.isTimedOut()) {
-              throw new ConnectException("Could not send noop upon connect! "
-                + "This may indicate a running, but not responding memcached "
-                + "instance.");
-            }
-          }
-
-          connected(node);
-          addedQueue.offer(node);
-          if (node.getWbuf().hasRemaining()) {
-            handleWrites(sk, node);
-          }
+          finishConnect(sk, node);
         } else {
           assert !channel.isConnected() : "connected";
         }
       } else {
-        if (sk.isValid() && sk.isReadable()) {
-          handleReads(sk, node);
-        }
-        if (sk.isValid() && sk.isWritable()) {
-          handleWrites(sk, node);
-        }
+        handleReadsAndWrites(sk, node);
       }
     } catch (ClosedChannelException e) {
-      // Note, not all channel closes end up here
       if (!shutDown) {
         getLogger().info("Closed channel and not shutting down. Queueing"
             + " reconnect on {}", node, e);
         lostConnection(node);
       }
     } catch (ConnectException e) {
-      // Failures to establish a connection should attempt a reconnect
-      // without signaling the observers.
       getLogger().info("Reconnecting due to failure to connect to {}", node, e);
       queueReconnect(node);
     } catch (OperationException e) {
-      node.setupForAuth(); // noop if !shouldAuth
+      node.setupForAuth();
       getLogger().info("Reconnection due to exception handling a memcached "
-          + "operation on {}. This may be due to an authentication failure.",
-          node, e);
+        + "operation on {}. This may be due to an authentication failure.",
+        node, e);
       lostConnection(node);
     } catch (Exception e) {
-      // Any particular error processing an item should simply
-      // cause us to reconnect to the server.
-      //
-      // One cause is just network oddness or servers
-      // restarting, which lead here with IOException
-      node.setupForAuth(); // noop if !shouldAuth
+      node.setupForAuth();
       getLogger().info("Reconnecting due to exception on {}", node, e);
       lostConnection(node);
     }
     node.fixupOps();
   }
 
-  private void handleWrites(SelectionKey sk, MemcachedNode qa)
-    throws IOException {
-    qa.fillWriteBuffer(shouldOptimize);
-    boolean canWriteMore = qa.getBytesRemainingToWrite() > 0;
-    while (canWriteMore) {
-      int wrote = qa.writeSome();
-      qa.fillWriteBuffer(shouldOptimize);
-      canWriteMore = wrote > 0 && qa.getBytesRemainingToWrite() > 0;
+  /**
+   * A helper method for {@link #handleIO(java.nio.channels.SelectionKey)} to
+   * handle reads and writes if appropriate.
+   *
+   * @param sk the selection key to use.
+   * @param node th enode to read write from.
+   * @throws IOException if an error occurs during read/write.
+   */
+  private void handleReadsAndWrites(final SelectionKey sk,
+    final MemcachedNode node) throws IOException {
+    if (sk.isValid()) {
+      if (sk.isReadable()) {
+        handleReads(node);
+      }
+      if (sk.isWritable()) {
+        handleWrites(node);
+      }
     }
   }
 
-  private void handleReads(SelectionKey sk, MemcachedNode qa)
+  /**
+   * Finish the connect phase and potentially verify its liveness.
+   *
+   * @param sk the selection key for the node.
+   * @param node the actual node.
+   * @throws IOException if something goes wrong during reading/writing.
+   */
+  private void finishConnect(final SelectionKey sk, final MemcachedNode node)
     throws IOException {
-    Operation currentOp = qa.getCurrentReadOp();
-    // If it's a tap ack there is no response
-    if (currentOp instanceof TapAckOperationImpl) {
-      qa.removeCurrentReadOp();
-      return;
-    }
-    ByteBuffer rbuf = qa.getRbuf();
-    final SocketChannel channel = qa.getChannel();
-    int read = channel.read(rbuf);
-    if (read < 0) {
-      if (currentOp instanceof TapOperation) {
-        // If were doing tap then we won't throw an exception
-        currentOp.getCallback().complete();
-        ((TapOperation) currentOp).streamClosed(OperationState.COMPLETE);
-        getLogger().debug("Completed read op: {} and giving the next {} bytes",
-            currentOp, rbuf.remaining());
-        Operation op = qa.removeCurrentReadOp();
-        assert op == currentOp : "Expected to pop " + currentOp + " got " + op;
-        currentOp = qa.getCurrentReadOp();
-      } else {
-        // our model is to keep the connection alive for future ops
-        // so we'll queue a reconnect if disconnected via an IOException
-        throw new IOException("Disconnected unexpected, will reconnect.");
+    if (verifyAliveOnConnect) {
+      final CountDownLatch latch = new CountDownLatch(1);
+      final OperationFuture<Boolean> rv = new OperationFuture<Boolean>("noop",
+        latch, 2500, listenerExecutorService);
+      NoopOperation testOp = opFact.noop(new OperationCallback() {
+        public void receivedStatus(OperationStatus status) {
+          rv.set(status.isSuccess(), status);
+        }
+
+        @Override
+        public void complete() {
+          latch.countDown();
+        }
+      });
+
+      testOp.setHandlingNode(node);
+      testOp.initialize();
+      checkState();
+      insertOperation(node, testOp);
+      node.copyInputQueue();
+
+      boolean done = false;
+      if (sk.isValid()) {
+        long timeout = TimeUnit.MILLISECONDS.toNanos(
+          connectionFactory.getOperationTimeout());
+
+        long stop = System.nanoTime() + timeout;
+        while (stop > System.nanoTime()) {
+          handleWrites(node);
+          handleReads(node);
+          if(done = (latch.getCount() == 0)) {
+            break;
+          }
+        }
+      }
+
+      if (!done || testOp.isCancelled() || testOp.hasErrored()
+        || testOp.isTimedOut()) {
+        throw new ConnectException("Could not send noop upon connect! "
+          + "This may indicate a running, but not responding memcached "
+          + "instance.");
       }
     }
+
+    connected(node);
+    addedQueue.offer(node);
+    if (node.getWbuf().hasRemaining()) {
+      handleWrites(node);
+    }
+  }
+
+  /**
+   * Handle pending writes for the given node.
+   *
+   * @param node the node to handle writes for.
+   * @throws IOException can be raised during writing failures.
+   */
+  private void handleWrites(final MemcachedNode node) throws IOException {
+    node.fillWriteBuffer(shouldOptimize);
+    boolean canWriteMore = node.getBytesRemainingToWrite() > 0;
+    while (canWriteMore) {
+      int wrote = node.writeSome();
+      metrics.updateHistogram(OVERALL_AVG_BYTES_WRITE_METRIC, wrote);
+      node.fillWriteBuffer(shouldOptimize);
+      canWriteMore = wrote > 0 && node.getBytesRemainingToWrite() > 0;
+    }
+  }
+
+  /**
+   * Handle pending reads for the given node.
+   *
+   * @param node the node to handle reads for.
+   * @throws IOException can be raised during reading failures.
+   */
+  private void handleReads(final MemcachedNode node) throws IOException {
+    Operation currentOp = node.getCurrentReadOp();
+    if (currentOp instanceof TapAckOperationImpl) {
+      node.removeCurrentReadOp();
+      return;
+    }
+
+    ByteBuffer rbuf = node.getRbuf();
+    final SocketChannel channel = node.getChannel();
+    int read = channel.read(rbuf);
+    metrics.updateHistogram(OVERALL_AVG_BYTES_READ_METRIC, read);
+    if (read < 0) {
+      currentOp = handleReadsWhenChannelEndOfStream(currentOp, node, rbuf);
+    }
+
     while (read > 0) {
       getLogger().debug("Read {} bytes", read);
       rbuf.flip();
@@ -559,34 +830,95 @@ public class MemcachedConnection extends SpyThread {
         if (currentOp == null) {
           throw new IllegalStateException("No read operation.");
         }
+
+        long timeOnWire =
+          System.nanoTime() - currentOp.getWriteCompleteTimestamp();
+        metrics.updateHistogram(OVERALL_AVG_TIME_ON_WIRE_METRIC,
+          (int)(timeOnWire / 1000));
+        metrics.markMeter(OVERALL_RESPONSE_METRIC);
         synchronized(currentOp) {
-          currentOp.readFromBuffer(rbuf);
-          if (currentOp.getState() == OperationState.COMPLETE) {
-            getLogger().debug("Completed read op: {} and giving the next {} "
-                + "bytes", currentOp, rbuf.remaining());
-            Operation op = qa.removeCurrentReadOp();
-            assert op == currentOp : "Expected to pop " + currentOp + " got "
-                + op;
-          } else if (currentOp.getState() == OperationState.RETRY) {
-            getLogger().debug("Reschedule read op due to NOT_MY_VBUCKET error: "
-                + "{} ", currentOp);
-            ((VBucketAware) currentOp).addNotMyVbucketNode(
-                currentOp.getHandlingNode());
-            Operation op = qa.removeCurrentReadOp();
-            assert op == currentOp : "Expected to pop " + currentOp + " got "
-                + op;
-            retryOps.add(currentOp);
-          }
+          readBufferAndLogMetrics(currentOp, rbuf, node);
         }
-        currentOp=qa.getCurrentReadOp();
+
+        currentOp = node.getCurrentReadOp();
       }
       rbuf.clear();
       read = channel.read(rbuf);
-      qa.completedRead();
+      node.completedRead();
     }
   }
 
-  // Make a debug string out of the given buffer's values
+  /**
+   * Read from the buffer and add metrics information.
+   *
+   * @param currentOp the current operation to read.
+   * @param rbuf the read buffer to read from.
+   * @param node the node to read from.
+   * @throws IOException if reading was not successful.
+   */
+  private void readBufferAndLogMetrics(final Operation currentOp,
+    final ByteBuffer rbuf, final MemcachedNode node) throws IOException {
+    currentOp.readFromBuffer(rbuf);
+    if (currentOp.getState() == OperationState.COMPLETE) {
+      getLogger().debug("Completed read op: {} and giving the next {} "
+        + "bytes", currentOp, rbuf.remaining());
+      Operation op = node.removeCurrentReadOp();
+      assert op == currentOp : "Expected to pop " + currentOp + " got "
+        + op;
+
+      if (op.hasErrored()) {
+        metrics.markMeter(OVERALL_RESPONSE_FAIL_METRIC);
+      } else {
+        metrics.markMeter(OVERALL_RESPONSE_SUCC_METRIC);
+      }
+    } else if (currentOp.getState() == OperationState.RETRY) {
+      handleRetryInformation(currentOp.getErrorMsg());
+      getLogger().debug("Reschedule read op due to NOT_MY_VBUCKET error: "
+        + "{} ", currentOp);
+      ((VBucketAware) currentOp).addNotMyVbucketNode(
+        currentOp.getHandlingNode());
+      Operation op = node.removeCurrentReadOp();
+      assert op == currentOp : "Expected to pop " + currentOp + " got "
+        + op;
+
+      retryOps.add(currentOp);
+      metrics.markMeter(OVERALL_RESPONSE_RETRY_METRIC);
+    }
+  }
+
+  /**
+   * Deal with an operation where the channel reached the end of a stream.
+   *
+   * @param currentOp the current operation to read.
+   * @param node the node for that operation.
+   * @param rbuf the read buffer.
+   *
+   * @return the next operation on the node to read.
+   * @throws IOException if disconnect while reading.
+   */
+  private Operation handleReadsWhenChannelEndOfStream(final Operation currentOp,
+    final MemcachedNode node, final ByteBuffer rbuf) throws IOException {
+    if (currentOp instanceof TapOperation) {
+      currentOp.getCallback().complete();
+      ((TapOperation) currentOp).streamClosed(OperationState.COMPLETE);
+
+      getLogger().debug("Completed read op: {} and giving the next {} bytes",
+        currentOp, rbuf.remaining());
+      Operation op = node.removeCurrentReadOp();
+      assert op == currentOp : "Expected to pop " + currentOp + " got " + op;
+      return node.getCurrentReadOp();
+    } else {
+      throw new IOException("Disconnected unexpected, will reconnect.");
+    }
+  }
+
+  /**
+   * Convert the {@link ByteBuffer} into a string for easier debugging.
+   *
+   * @param b the buffer to debug.
+   * @param size the size of the buffer.
+   * @return the stringified {@link ByteBuffer}.
+   */
   static String dbgBuffer(ByteBuffer b, int size) {
     StringBuilder sb = new StringBuilder();
     byte[] bytes = b.array();
@@ -602,181 +934,293 @@ public class MemcachedConnection extends SpyThread {
     return sb.toString();
   }
 
-  protected void queueReconnect(MemcachedNode qa) {
-    if (!shutDown) {
-      getLogger().warn("Closing, and reopening {}, attempt {}.", qa,
-          qa.getReconnectCount());
-      if (qa.getSk() != null) {
-        qa.getSk().cancel();
-        assert !qa.getSk().isValid() : "Cancelled selection key is valid";
+  /**
+   * Optionally handle retry (NOT_MY_VBUKET) responses.
+   *
+   * This method can be overridden in subclasses to handle the content
+   * of the retry message appropriately.
+   *
+   * @param retryMessage the body of the retry message.
+   */
+  protected void handleRetryInformation(final byte[] retryMessage) {
+    getLogger().debug("Got RETRY message: " + new String(retryMessage)
+      + ", but not handled.");
+  }
+
+  /**
+   * Enqueue the given {@link MemcachedNode} for reconnect.
+   *
+   * @param node the node to reconnect.
+   */
+  protected void queueReconnect(final MemcachedNode node) {
+    if (shutDown) {
+      return;
+    }
+    getLogger().warn("Closing, and reopening {}, attempt {}.", node,
+      node.getReconnectCount());
+
+    if (node.getSk() != null) {
+      node.getSk().cancel();
+      assert !node.getSk().isValid() : "Cancelled selection key is valid";
+    }
+    node.reconnecting();
+
+    try {
+      if (node.getChannel() != null && node.getChannel().socket() != null) {
+        node.getChannel().socket().close();
+      } else {
+        getLogger().info("The channel or socket was null for {}", node);
       }
-      qa.reconnecting();
-      try {
-        if (qa.getChannel() != null && qa.getChannel().socket() != null) {
-          qa.getChannel().socket().close();
-        } else {
-          getLogger().info("The channel or socket was null for {}", qa);
-        }
-      } catch (IOException e) {
-        getLogger().warn("IOException trying to close a socket", e);
-      }
-      qa.setChannel(null);
+    } catch (IOException e) {
+      getLogger().warn("IOException trying to close a socket", e);
+    }
+    node.setChannel(null);
 
-      long delay = (long) Math.min(maxDelay, Math.pow(2,
-          qa.getReconnectCount())) * 1000;
-      long reconTime = System.currentTimeMillis() + delay;
+    long delay = (long) Math.min(maxDelay, Math.pow(2,
+        node.getReconnectCount())) * 1000;
+    long reconnectTime = System.currentTimeMillis() + delay;
+    while (reconnectQueue.containsKey(reconnectTime)) {
+      reconnectTime++;
+    }
 
-      // Avoid potential condition where two connections are scheduled
-      // for reconnect at the exact same time. This is expected to be
-      // a rare situation.
-      while (reconnectQueue.containsKey(reconTime)) {
-        reconTime++;
-      }
+    reconnectQueue.put(reconnectTime, node);
+    metrics.incrementCounter(RECON_QUEUE_METRIC);
 
-      reconnectQueue.put(reconTime, qa);
-
-      // Need to do a little queue management.
-      qa.setupResend();
-
-      if (failureMode == FailureMode.Redistribute) {
-        redistributeOperations(qa.destroyInputQueue());
-      } else if (failureMode == FailureMode.Cancel) {
-        cancelOperations(qa.destroyInputQueue());
-      }
+    node.setupResend();
+    if (failureMode == FailureMode.Redistribute) {
+      redistributeOperations(node.destroyInputQueue());
+    } else if (failureMode == FailureMode.Cancel) {
+      cancelOperations(node.destroyInputQueue());
     }
   }
 
-  private void cancelOperations(Collection<Operation> ops) {
+  /**
+   * Cancel the given collection of operations.
+   *
+   * @param ops the list of operations to cancel.
+   */
+  private void cancelOperations(final Collection<Operation> ops) {
     for (Operation op : ops) {
       op.cancel();
     }
   }
 
-  private void redistributeOperations(Collection<Operation> ops) {
+  /**
+   * Redistribute the given list of operations to (potentially) other nodes.
+   *
+   * Note that operations can only be redistributed if they have not been
+   * cancelled already, timed out already or do not have definite targets
+   * (a key).
+   *
+   * @param ops the operations to redistribute.
+   */
+  public void redistributeOperations(final Collection<Operation> ops) {
     for (Operation op : ops) {
-      if (op.isCancelled() || op.isTimedOut()) {
-        continue;
-      }
-      if (op instanceof KeyedOperation) {
-        KeyedOperation ko = (KeyedOperation) op;
-        int added = 0;
-        for (String k : ko.getKeys()) {
-          for (Operation newop : opFact.clone(ko)) {
-            addOperation(k, newop);
-            added++;
-          }
-        }
-        assert added > 0 : "Didn't add any new operations when redistributing";
-      } else {
-        // Cancel things that don't have definite targets.
-        op.cancel();
-      }
+      redistributeOperation(op);
     }
   }
 
-  private void attemptReconnects() throws IOException {
+  /**
+   * Redistribute the given operation to (potentially) other nodes.
+   *
+   * Note that operations can only be redistributed if they have not been
+   * cancelled already, timed out already or do not have definite targets
+   * (a key).
+   *
+   * @param op the operation to redistribute.
+   */
+  public void redistributeOperation(Operation op) {
+    if (op.isCancelled() || op.isTimedOut()) {
+      return;
+    }
+
+    if (op.getCloneCount() >= MAX_CLONE_COUNT) {
+      getLogger().warn("Cancelling operation " + op + "because it has been "
+        + "retried (cloned) more than " + MAX_CLONE_COUNT + "times.");
+      op.cancel();
+      return;
+    }
+
+    // The operation gets redistributed but has never been actually written,
+    // it we just straight re-add it without cloning.
+    if (op.getState() == OperationState.WRITE_QUEUED && op.getHandlingNode() != null) {
+      addOperation(op.getHandlingNode(), op);
+      return;
+    }
+
+    if (op instanceof MultiGetOperationImpl) {
+      for (String key : ((MultiGetOperationImpl) op).getRetryKeys()) {
+        addOperation(key, opFact.get(key,
+          (GetOperation.Callback) op.getCallback()));
+      }
+    } else if (op instanceof KeyedOperation) {
+      KeyedOperation ko = (KeyedOperation) op;
+      int added = 0;
+      for (Operation newop : opFact.clone(ko)) {
+        if (newop instanceof KeyedOperation) {
+          KeyedOperation newKeyedOp = (KeyedOperation) newop;
+          for (String k : newKeyedOp.getKeys()) {
+            addOperation(k, newop);
+            op.addClone(newop);
+            newop.setCloneCount(op.getCloneCount()+1);
+          }
+        } else {
+          newop.cancel();
+          getLogger().warn("Could not redistribute cloned non-keyed " +
+            "operation", newop);
+        }
+        added++;
+      }
+      assert added > 0 : "Didn't add any new operations when redistributing";
+    } else {
+      op.cancel();
+    }
+  }
+
+  /**
+   * Attempt to reconnect {@link MemcachedNode}s in the reconnect queue.
+   *
+   * If the {@link MemcachedNode} does not belong to the cluster list anymore,
+   * the reconnect attempt is cancelled. If it does, the code tries to
+   * reconnect immediately and if this is not possible it waits until the
+   * connection information arrives.
+   *
+   * Note that if a socket error arises during reconnect, the node is scheduled
+   * for re-reconnect immediately.
+   */
+  private void attemptReconnects() {
     final long now = System.currentTimeMillis();
     final Map<MemcachedNode, Boolean> seen =
-        new IdentityHashMap<MemcachedNode, Boolean>();
+      new IdentityHashMap<MemcachedNode, Boolean>();
     final List<MemcachedNode> rereQueue = new ArrayList<MemcachedNode>();
     SocketChannel ch = null;
-    for (Iterator<MemcachedNode> i =
-        reconnectQueue.headMap(now).values().iterator(); i.hasNext();) {
-      final MemcachedNode qa = i.next();
+
+
+    Iterator<MemcachedNode> i = reconnectQueue.headMap(now).values().iterator();
+    while(i.hasNext()) {
+      final MemcachedNode node = i.next();
       i.remove();
+      metrics.decrementCounter(RECON_QUEUE_METRIC);
+
       try {
-        if(!belongsToCluster(qa)) {
+        if (!belongsToCluster(node)) {
           getLogger().debug("Node does not belong to cluster anymore, "
-            + "skipping reconnect: {}", qa);
+            + "skipping reconnect: {}", node);
           continue;
         }
-        if (!seen.containsKey(qa)) {
-          seen.put(qa, Boolean.TRUE);
-          getLogger().info("Reconnecting {}", qa);
+
+        if (!seen.containsKey(node)) {
+          seen.put(node, Boolean.TRUE);
+          getLogger().info("Reconnecting {}", node);
+
           ch = SocketChannel.open();
           ch.configureBlocking(false);
+          ch.socket().setTcpNoDelay(!connectionFactory.useNagleAlgorithm());
           int ops = 0;
-          if (ch.connect(qa.getSocketAddress())) {
-            connected(qa);
-            addedQueue.offer(qa);
-            getLogger().info("Immediately reconnected to {}", qa);
+          if (ch.connect(node.getSocketAddress())) {
+            connected(node);
+            addedQueue.offer(node);
+            getLogger().info("Immediately reconnected to {}", node);
             assert ch.isConnected();
           } else {
             ops = SelectionKey.OP_CONNECT;
           }
-          qa.registerChannel(ch, ch.register(selector, ops, qa));
-          assert qa.getChannel() == ch : "Channel was lost.";
+          node.registerChannel(ch, ch.register(selector, ops, node));
+          assert node.getChannel() == ch : "Channel was lost.";
         } else {
-          getLogger().debug("Skipping duplicate reconnect request for {}", qa);
+          getLogger().debug("Skipping duplicate reconnect request for {}",
+            node);
         }
       } catch (SocketException e) {
         getLogger().warn("Error on reconnect", e);
-        rereQueue.add(qa);
+        rereQueue.add(node);
       } catch (Exception e) {
-        getLogger().error("Exception on reconnect, lost node {}", qa, e);
+        getLogger().error("Exception on reconnect, lost node {}", node, e);
       } finally {
-        // it's possible that above code will leak file descriptors under
-        // abnormal
-        // conditions (when ch.open() fails and throws IOException.
-        // always close non connected channel
-        if (ch != null && !ch.isConnected() && !ch.isConnectionPending()) {
-          try {
-            ch.close();
-          } catch (IOException x) {
-            getLogger().error("Exception closing channel: {}", qa, x);
-          }
-        }
+        potentiallyCloseLeakingChannel(ch, node);
       }
     }
-    // Requeue any fast-failed connects.
+
     for (MemcachedNode n : rereQueue) {
       queueReconnect(n);
     }
   }
 
   /**
-   * Get the node locator used by this connection.
+   * Make sure channel connections are not leaked and properly close under
+   * faulty reconnect cirumstances.
+   *
+   * @param ch the channel to potentially close.
+   * @param node the node to which the channel should be bound to.
+   */
+  private void potentiallyCloseLeakingChannel(final SocketChannel ch,
+    final MemcachedNode node) {
+    if (ch != null && !ch.isConnected() && !ch.isConnectionPending()) {
+      try {
+        ch.close();
+      } catch (IOException e) {
+        getLogger().error("Exception closing channel: {}", node, e);
+      }
+    }
+  }
+
+  /**
+   * Returns the {@link NodeLocator} in use for this connection.
+   *
+   * @return  the current {@link NodeLocator}.
    */
   public NodeLocator getLocator() {
     return locator;
   }
 
-  public void enqueueOperation(String key, Operation o) {
-    StringUtils.validateKey(key, opFact instanceof BinaryOperationFactory);
+  /**
+   * Enqueue the given {@link Operation} with the used key.
+   *
+   * @param key the key to use.
+   * @param o the {@link Operation} to enqueue.
+   */
+  public void enqueueOperation(final String key, final Operation o) {
     checkState();
+    StringUtils.validateKey(key, opFact instanceof BinaryOperationFactory);
     addOperation(key, o);
   }
 
   /**
-   * Add an operation to the given connection.
+   * Add an operation to a connection identified by the given key.
    *
-   * @param key the key the operation is operating upon
-   * @param o the operation
+   * If the {@link MemcachedNode} is active or the {@link FailureMode} is set
+   * to retry, the primary node will be used for that key. If the primary
+   * node is not available and the {@link FailureMode} cancel is used, the
+   * operation will be cancelled without further retry.
+   *
+   * For any other {@link FailureMode} mechanisms (Redistribute), another
+   * possible node is used (only if its active as well). If no other active
+   * node could be identified, the original primary node is used and retried.
+   *
+   * @param key the key the operation is operating upon.
+   * @param o the operation to add.
    */
   protected void addOperation(final String key, final Operation o) {
-
     MemcachedNode placeIn = null;
     MemcachedNode primary = locator.getPrimary(key);
+
     if (primary.isActive() || failureMode == FailureMode.Retry) {
       placeIn = primary;
     } else if (failureMode == FailureMode.Cancel) {
       o.cancel();
     } else {
-      // Look for another node in sequence that is ready.
-      for (Iterator<MemcachedNode> i = locator.getSequence(key); placeIn == null
-          && i.hasNext();) {
+      Iterator<MemcachedNode> i = locator.getSequence(key);
+      while (placeIn == null && i.hasNext()) {
         MemcachedNode n = i.next();
         if (n.isActive()) {
           placeIn = n;
         }
       }
-      // If we didn't find an active node, queue it in the primary node
-      // and wait for it to come back online.
+
       if (placeIn == null) {
         placeIn = primary;
-        this.getLogger().warn(
-            "Could not redistribute "
-                + "to another node, retrying primary node for {}.", key);
+        this.getLogger().warn("Could not redistribute to another node, "
+          + "retrying primary node for {}.", key);
       }
     }
 
@@ -784,58 +1228,82 @@ public class MemcachedConnection extends SpyThread {
     if (placeIn != null) {
       addOperation(placeIn, o);
     } else {
-      assert o.isCancelled() : "No node found for " + key
-          + " (and not immediately cancelled)";
+      assert o.isCancelled() : "No node found for " + key + " (and not "
+        + "immediately cancelled)";
     }
   }
 
+  /**
+   * Insert an operation on the given node to the beginning of the queue.
+   *
+   * @param node the node where to insert the {@link Operation}.
+   * @param o the operation to insert.
+   */
   public void insertOperation(final MemcachedNode node, final Operation o) {
     o.setHandlingNode(node);
     o.initialize();
     node.insertOp(o);
     addedQueue.offer(node);
+    metrics.markMeter(OVERALL_REQUEST_METRIC);
+
     Selector s = selector.wakeup();
     assert s == selector : "Wakeup returned the wrong selector.";
     getLogger().debug("Added {} to {}", o, node);
   }
 
+  /**
+   * Enqueue an operation on the given node.
+   *
+   * @param node the node where to enqueue the {@link Operation}.
+   * @param o the operation to add.
+   */
   protected void addOperation(final MemcachedNode node, final Operation o) {
+    if (!node.isAuthenticated()) {
+      retryOperation(o);
+      return;
+    }
     o.setHandlingNode(node);
     o.initialize();
     node.addOp(o);
     addedQueue.offer(node);
+    metrics.markMeter(OVERALL_REQUEST_METRIC);
+
     Selector s = selector.wakeup();
     assert s == selector : "Wakeup returned the wrong selector.";
     getLogger().debug("Added {} to {}", o, node);
   }
 
+  /**
+   * Enqueue the given list of operations on each handling node.
+   *
+   * @param ops the operations for each node.
+   */
   public void addOperations(final Map<MemcachedNode, Operation> ops) {
-
     for (Map.Entry<MemcachedNode, Operation> me : ops.entrySet()) {
-      final MemcachedNode node = me.getKey();
-      Operation o = me.getValue();
-      o.setHandlingNode(node);
-      o.initialize();
-      node.addOp(o);
-      addedQueue.offer(node);
+      addOperation(me.getKey(), me.getValue());
     }
-    Selector s = selector.wakeup();
-    assert s == selector : "Wakeup returned the wrong selector.";
   }
 
   /**
    * Broadcast an operation to all nodes.
+   *
+   * @return a {@link CountDownLatch} that will be counted down when the
+   *         operations are complete.
    */
-  public CountDownLatch broadcastOperation(BroadcastOpFactory of) {
+  public CountDownLatch broadcastOperation(final BroadcastOpFactory of) {
     return broadcastOperation(of, locator.getAll());
   }
 
   /**
-   * Broadcast an operation to a specific collection of nodes.
+   * Broadcast an operation to a collection of nodes.
+   *
+   * @return a {@link CountDownLatch} that will be counted down when the
+   *         operations are complete.
    */
   public CountDownLatch broadcastOperation(final BroadcastOpFactory of,
-      Collection<MemcachedNode> nodes) {
+    final Collection<MemcachedNode> nodes) {
     final CountDownLatch latch = new CountDownLatch(nodes.size());
+
     for (MemcachedNode node : nodes) {
       getLogger().debug("broadcast Operation: node = " + node);
       Operation op = of.newOp(node, latch);
@@ -843,33 +1311,39 @@ public class MemcachedConnection extends SpyThread {
       node.addOp(op);
       op.setHandlingNode(node);
       addedQueue.offer(node);
+      metrics.markMeter(OVERALL_REQUEST_METRIC);
     }
+
     Selector s = selector.wakeup();
     assert s == selector : "Wakeup returned the wrong selector.";
     return latch;
   }
 
   /**
-   * Shut down all of the connections.
+   * Shut down all connections and do not accept further incoming ops.
    */
   public void shutdown() throws IOException {
     shutDown = true;
-    Selector s = selector.wakeup();
-    assert s == selector : "Wakeup returned the wrong selector.";
-    for (MemcachedNode qa : locator.getAll()) {
-      if (qa.getChannel() != null) {
-        qa.getChannel().close();
-        qa.setSk(null);
-        if (qa.getBytesRemainingToWrite() > 0) {
-          getLogger().warn("Shut down with {} bytes remaining to write",
-              qa.getBytesRemainingToWrite());
+    try {
+      Selector s = selector.wakeup();
+      assert s == selector : "Wakeup returned the wrong selector.";
+      for (MemcachedNode node : locator.getAll()) {
+        if (node.getChannel() != null) {
+          node.getChannel().close();
+          node.setSk(null);
+          if (node.getBytesRemainingToWrite() > 0) {
+            getLogger().warn("Shut down with {} bytes remaining to write",
+              node.getBytesRemainingToWrite());
+          }
+          getLogger().debug("Shut down channel {}", node.getChannel());
         }
-        getLogger().debug("Shut down channel {}", qa.getChannel());
       }
+
+      selector.close();
+      getLogger().debug("Shut down selector {}", selector);
+    } finally {
+      running = false;
     }
-    running = false;
-    selector.close();
-    getLogger().debug("Shut down selector {}", selector);
   }
 
   @Override
@@ -877,75 +1351,82 @@ public class MemcachedConnection extends SpyThread {
     StringBuilder sb = new StringBuilder();
     sb.append("{MemcachedConnection to");
     for (MemcachedNode qa : locator.getAll()) {
-      sb.append(" ");
-      sb.append(qa.getSocketAddress());
+      sb.append(" ").append(qa.getSocketAddress());
     }
     sb.append("}");
     return sb.toString();
   }
 
   /**
-   * Get information about connections and their active status.
+   * Construct a String containing information about all nodes and their state.
+   *
+   * @return a stringified representation of the connection status.
    */
   public String connectionsStatus() {
     StringBuilder connStatus = new StringBuilder();
     connStatus.append("Connection Status {");
     for (MemcachedNode node : locator.getAll()) {
-      connStatus.append(" ");
-      connStatus.append(node.getSocketAddress())
-        .append(" active: ").append(node.isActive())
-        .append(", authed: ").append(node.isAuthenticated())
+      connStatus
+        .append(" ")
+        .append(node.getSocketAddress())
+        .append(" active: ")
+        .append(node.isActive())
+        .append(", authed: ")
+        .append(node.isAuthenticated())
         .append(MessageFormat.format(", last read: {0} ms ago",
           node.lastReadDelta()));
     }
-
     connStatus.append(" }");
     return connStatus.toString();
   }
 
   /**
-   * helper method: increase timeout count on node attached to this op.
+   * Increase the timeout counter for the given handling node.
    *
-   * @param op
+   * @param op the operation to grab the node from.
    */
-  public static void opTimedOut(Operation op) {
+  public static void opTimedOut(final Operation op) {
     MemcachedConnection.setTimeout(op, true);
   }
 
   /**
-   * helper method: reset timeout counter.
+   * Reset the timeout counter for the given handling node.
    *
-   * @param op
+   * @param op the operation to grab the node from.
    */
-  public static void opSucceeded(Operation op) {
+  public static void opSucceeded(final Operation op) {
     MemcachedConnection.setTimeout(op, false);
   }
 
   /**
-   * helper method: do some error checking and set timeout boolean.
+   * Set the continous timeout on an operation.
    *
-   * @param op
-   * @param isTimeout
+   * @param op the operation to use.
+   * @param isTimeout is timed out or not.
    */
-  private static void setTimeout(Operation op, boolean isTimeout) {
+  private static void setTimeout(final Operation op, final boolean isTimeout) {
+    Logger logger = LoggerFactory.getLogger(MemcachedConnection.class);
+
     try {
       if (op == null || op.isTimedOutUnsent()) {
-        return; // op may be null in some cases, e.g. flush
+        return;
       }
+
       MemcachedNode node = op.getHandlingNode();
       if (node == null) {
-        LoggerFactory.getLogger(MemcachedConnection.class).warn(
-            "handling node for operation is not set");
+        logger.warn("handling node for operation is not set");
       } else {
         node.setContinuousTimeout(isTimeout);
       }
     } catch (Exception e) {
-      LoggerFactory.getLogger(MemcachedConnection.class).error(e.getMessage());
+      logger.error(e.getMessage());
     }
   }
 
   /**
    * Check to see if this connection is shutting down.
+   *
+   * @throws IllegalStateException when shutting down.
    */
   protected void checkState() {
     if (shutDown) {
@@ -955,7 +1436,7 @@ public class MemcachedConnection extends SpyThread {
   }
 
   /**
-   * Infinitely loop processing IO.
+   * Handle IO as long as the application is running.
    */
   @Override
   public void run() {
@@ -977,13 +1458,38 @@ public class MemcachedConnection extends SpyThread {
     getLogger().info("Shut down memcached client");
   }
 
-  private void logRunException(Exception e) {
+  /**
+   * Log a exception to different levels depending on the state.
+   *
+   * Exceptions get logged at debug level when happening during shutdown, but
+   * at warning level when operating normally.
+   *
+   * @param e the exception to log.
+   */
+  private void logRunException(final Exception e) {
     if (shutDown) {
-      // There are a couple types of errors that occur during the
-      // shutdown sequence that are considered OK. Log at debug.
       getLogger().debug("Exception occurred during shutdown", e);
     } else {
       getLogger().warn("Problem handling memcached IO", e);
     }
   }
+
+  /**
+   * Returns whether the connection is shut down or not.
+   *
+   * @return true if the connection is shut down, false otherwise.
+   */
+  public boolean isShutDown() {
+    return shutDown;
+  }
+
+  /**
+   * Add a operation to the retry queue.
+   *
+   * @param op the operation to retry.
+   */
+  public void retryOperation(Operation op) {
+    retryOps.add(op);
+  }
+
 }

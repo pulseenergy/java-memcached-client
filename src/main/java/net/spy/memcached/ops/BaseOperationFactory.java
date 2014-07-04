@@ -23,11 +23,11 @@
 
 package net.spy.memcached.ops;
 
-import java.util.ArrayList;
-import java.util.Collection;
-
 import net.spy.memcached.MemcachedNode;
 import net.spy.memcached.OperationFactory;
+
+import java.util.ArrayList;
+import java.util.Collection;
 
 /**
  * Base class for operation factories.
@@ -55,6 +55,13 @@ public abstract class BaseOperationFactory implements OperationFactory {
       rv.addAll(cloneGet(op));
     } else if (op instanceof ReplicaGetOperation) {
       rv.addAll(cloneGet(op));
+    } else if (op instanceof ReplicaGetsOperation) {
+      ReplicaGetsOperation.Callback callback =
+        (ReplicaGetsOperation.Callback) op.getCallback();
+      for (String k : op.getKeys()) {
+        rv.add(replicaGets(k,
+          ((ReplicaGetsOperation) op).getReplicaIndex(), callback));
+      }
     } else if (op instanceof GetsOperation) {
       GetsOperation.Callback callback =
           (GetsOperation.Callback) op.getCallback();
@@ -82,6 +89,14 @@ public abstract class BaseOperationFactory implements OperationFactory {
       ConcatenationOperation c = (ConcatenationOperation) op;
       rv.add(cat(c.getStoreType(), c.getCasValue(), first(op.getKeys()),
           c.getData(), c.getCallback()));
+    } else if(op instanceof GetAndTouchOperation) {
+      GetAndTouchOperation gt = (GetAndTouchOperation) op;
+      rv.add(getAndTouch(first(gt.getKeys()), gt.getExpiration(),
+        (GetAndTouchOperation.Callback) gt.getCallback()));
+    } else if (op instanceof ObserveOperation) {
+      ObserveOperation oo = (ObserveOperation) op;
+      rv.add(observe(first(oo.getKeys()), oo.getCasValue(), oo.getIndex(),
+        (ObserveOperation.Callback) oo.getCallback()));
     } else {
       assert false : "Unhandled operation type: " + op.getClass();
     }

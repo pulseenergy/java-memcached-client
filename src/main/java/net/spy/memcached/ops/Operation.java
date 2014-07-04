@@ -151,4 +151,37 @@ public interface Operation {
    * written to the network, this will be true.
    */
   boolean isTimedOutUnsent();
+
+  /**
+   * Returns the timestamp from the point where the WRITE was completed.
+   *
+   * This can be used to calculate the roundtrip time of the operation.
+   */
+  long getWriteCompleteTimestamp();
+
+  /**
+   * Returns the raw bytes of the error message content.
+   *
+   * @return the raw error message content.
+   */
+  byte[] getErrorMsg();
+
+  /**
+   * Add the clone from this operation.
+   *
+   * @param op the cloned operation.
+   */
+  void addClone(Operation op);
+
+  /**
+   * Returns the number of times this operation has been cloned.
+   *
+   * @return the number of clones.
+   */
+  int getCloneCount();
+
+  /**
+   * Sets the clone count for this operation.
+   */
+  void setCloneCount(int count);
 }

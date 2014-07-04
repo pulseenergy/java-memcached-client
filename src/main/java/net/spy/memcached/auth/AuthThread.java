@@ -1,6 +1,6 @@
 /**
  * Copyright (C) 2006-2009 Dustin Sallings
- * Copyright (C) 2009-2011 Couchbase, Inc.
+ * Copyright (C) 2009-2014 Couchbase, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -24,6 +24,7 @@
 package net.spy.memcached.auth;
 
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -41,6 +42,20 @@ import net.spy.memcached.ops.OperationStatus;
  */
 public class AuthThread extends SpyThread {
 
+  /**
+   * If a SASL step takes longer than this period in milliseconds, a warning
+   * will be issued instead of a debug message.
+   */
+  public static final int AUTH_ROUNDTRIP_THRESHOLD = 250;
+
+  /**
+   * If the total AUTH steps take longer than this period in milliseconds, a
+   * warning will be issued instead of a debug message.
+   */
+  public static final int AUTH_TOTAL_THRESHOLD = 1000;
+
+  public static final String MECH_SEPARATOR = " ";
+
   private final MemcachedConnection conn;
   private final AuthDescriptor authDescriptor;
   private final OperationFactory opFact;
@@ -55,17 +70,96 @@ public class AuthThread extends SpyThread {
     start();
   }
 
+  protected String[] listSupportedSASLMechanisms(AtomicBoolean done) {
+    final CountDownLatch listMechsLatch = new CountDownLatch(1);
+    final AtomicReference<String> supportedMechs =
+      new AtomicReference<String>();
+    Operation listMechsOp = opFact.saslMechs(new OperationCallback() {
+      @Override
+      public void receivedStatus(OperationStatus status) {
+        if(status.isSuccess()) {
+          supportedMechs.set(status.getMessage());
+          getLogger().debug("Received SASL supported mechs: "
+            + status.getMessage());
+        } else {
+          getLogger().warn("Received non-success response for SASL mechs: "
+            + status);
+        }
+      }
+
+      @Override
+      public void complete() {
+        listMechsLatch.countDown();
+      }
+
+    });
+
+    conn.insertOperation(node, listMechsOp);
+
+    try {
+      if (!conn.isShutDown()) {
+        listMechsLatch.await();
+      } else {
+        done.set(true); // Connection is shutting down, tear.down.
+      }
+    } catch(InterruptedException ex) {
+      getLogger().warn("Interrupted in Auth while waiting for SASL mechs.");
+      // we can be interrupted if we were in the
+      // process of auth'ing and the connection is
+      // lost or dropped due to bad auth
+      Thread.currentThread().interrupt();
+      if (listMechsOp != null) {
+        listMechsOp.cancel();
+      }
+      done.set(true); // If we were interrupted, tear down.
+    }
+
+    String supported = supportedMechs.get();
+    if (supported == null || supported.isEmpty()) {
+      return null;
+    }
+    return supported.split(MECH_SEPARATOR);
+  }
+
   @Override
   public void run() {
-    OperationStatus priorStatus = null;
     final AtomicBoolean done = new AtomicBoolean();
+    long totalStart = System.nanoTime();
 
+    String[] supportedMechs;
+    long mechsStart = System.nanoTime();
+    if (authDescriptor.getMechs() == null
+      || authDescriptor.getMechs().length == 0) {
+      supportedMechs = listSupportedSASLMechanisms(done);
+    } else {
+      supportedMechs = authDescriptor.getMechs();
+    }
+    long mechsDiff = TimeUnit.NANOSECONDS.toMillis(System.nanoTime()
+      - mechsStart);
+    String msg = String.format("SASL List Mechanisms took %dms on %s",
+      mechsDiff, node.toString());
+    if (mechsDiff >= AUTH_ROUNDTRIP_THRESHOLD) {
+        getLogger().warn(msg);
+    } else {
+        getLogger().debug(msg);
+    }
+
+    if (supportedMechs == null || supportedMechs.length == 0) {
+      getLogger().warn("Authentication failed to " + node.getSocketAddress()
+        + ", got empty SASL auth mech list.");
+      throw new IllegalStateException("Got empty SASL auth mech list.");
+    }
+
+    OperationStatus priorStatus = null;
     while (!done.get()) {
+      long stepStart = System.nanoTime();
       final CountDownLatch latch = new CountDownLatch(1);
       final AtomicReference<OperationStatus> foundStatus =
-          new AtomicReference<OperationStatus>();
+        new AtomicReference<OperationStatus>();
 
       final OperationCallback cb = new OperationCallback() {
+
+        @Override
         public void receivedStatus(OperationStatus val) {
           // If the status we found was null, we're done.
           if (val.getMessage().length() == 0) {
@@ -77,17 +171,22 @@ public class AuthThread extends SpyThread {
           }
         }
 
+        @Override
         public void complete() {
           latch.countDown();
         }
       };
 
       // Get the prior status to create the correct operation.
-      final Operation op = buildOperation(priorStatus, cb);
+      final Operation op = buildOperation(priorStatus, cb, supportedMechs);
       conn.insertOperation(node, op);
 
       try {
-        latch.await();
+        if (!conn.isShutDown()) {
+          latch.await();
+        } else {
+          done.set(true); // Connection is shutting down, tear.down.
+        }
         Thread.sleep(100);
       } catch (InterruptedException e) {
         // we can be interrupted if we were in the
@@ -98,27 +197,47 @@ public class AuthThread extends SpyThread {
           op.cancel();
         }
         done.set(true); // If we were interrupted, tear down.
+      } finally {
+        long stepDiff = TimeUnit.NANOSECONDS.toMillis(System.nanoTime()
+          - stepStart);
+        msg = String.format("SASL Step took %dms on %s",
+          stepDiff, node.toString());
+        if (mechsDiff >= AUTH_ROUNDTRIP_THRESHOLD) {
+            getLogger().warn(msg);
+        } else {
+            getLogger().debug(msg);
+        }
       }
 
       // Get the new status to inspect it.
       priorStatus = foundStatus.get();
       if (priorStatus != null) {
         if (!priorStatus.isSuccess()) {
-          getLogger().warn(
-              "Authentication failed to " + node.getSocketAddress());
+          getLogger().warn("Authentication failed to " + node.getSocketAddress()
+            + ", Status: " + priorStatus);
         }
       }
     }
-    return;
+
+    long totalDiff = TimeUnit.NANOSECONDS.toMillis(System.nanoTime()
+      - totalStart);
+    msg = String.format("SASL Auth took %dms on %s",
+      totalDiff, node.toString());
+    if (mechsDiff >= AUTH_TOTAL_THRESHOLD) {
+        getLogger().warn(msg);
+    } else {
+        getLogger().debug(msg);
+    }
   }
 
-  private Operation buildOperation(OperationStatus st, OperationCallback cb) {
+  private Operation buildOperation(OperationStatus st, OperationCallback cb,
+    final String [] supportedMechs) {
     if (st == null) {
-      return opFact.saslAuth(authDescriptor.getMechs(),
+      return opFact.saslAuth(supportedMechs,
           node.getSocketAddress().toString(), null,
           authDescriptor.getCallback(), cb);
     } else {
-      return opFact.saslStep(authDescriptor.getMechs(), KeyUtil.getKeyBytes(
+      return opFact.saslStep(supportedMechs, KeyUtil.getKeyBytes(
           st.getMessage()), node.getSocketAddress().toString(), null,
           authDescriptor.getCallback(), cb);
     }

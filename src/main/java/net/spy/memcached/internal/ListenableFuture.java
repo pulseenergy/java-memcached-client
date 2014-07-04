@@ -1,5 +1,6 @@
 /**
- * Copyright (C) 2009-2012 Couchbase, Inc.
+ * Copyright (C) 2006-2009 Dustin Sallings
+ * Copyright (C) 2009-2013 Couchbase, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -20,33 +21,32 @@
  * IN THE SOFTWARE.
  */
 
-package net.spy.memcached.util;
+package net.spy.memcached.internal;
 
-import java.util.Collection;
-import java.util.LinkedList;
-
-import junit.framework.TestCase;
-
-import org.junit.Test;
+import java.util.concurrent.Future;
 
 /**
- * Test various classes in the net.spy.memcached.util package.
+ * A {@link Future} that accepts one or more listeners that will be executed
+ * asynchronously.
  */
-public class UtilTest extends TestCase {
-  public void setup() {
-    // Empty
-  }
+public interface ListenableFuture<T, L extends GenericCompletionListener>
+  extends Future<T> {
 
-  public void teardown() {
-    // Empty
-  }
+  /**
+   * Add a listener to the future, which will be executed once the operation
+   * completes.
+   *
+   * @param listener the listener which will be executed.
+   * @return the current future to allow for object-chaining.
+   */
+  Future<T> addListener(L listener);
 
-  @Test
-  public void testJoin() {
-    Collection<String> keys = new LinkedList<String>();
-    keys.add("key1");
-    keys.add("key2");
-    keys.add("key3");
-    assertEquals("key1,key2,key3", StringUtils.join(keys, ","));
-  }
+  /**
+   * Remove a previously added listener from the future.
+   *
+   * @param listener the previously added listener.
+   * @return the current future to allow for object-chaining.
+   */
+  Future<T> removeListener(L listener);
+
 }

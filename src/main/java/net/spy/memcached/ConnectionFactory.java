@@ -1,5 +1,6 @@
 /**
  * Copyright (C) 2006-2009 Dustin Sallings
+ * Copyright (C) 2009-2013 Couchbase, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -29,8 +30,11 @@ import java.nio.channels.SocketChannel;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
 
 import net.spy.memcached.auth.AuthDescriptor;
+import net.spy.memcached.metrics.MetricCollector;
+import net.spy.memcached.metrics.MetricType;
 import net.spy.memcached.ops.Operation;
 import net.spy.memcached.transcoders.Transcoder;
 
@@ -78,6 +82,18 @@ public interface ConnectionFactory {
    * wait to add a new item to a queue.
    */
   long getOpQueueMaxBlockTime();
+
+  /**
+   * Get the ExecutorService which is used to asynchronously execute listeners
+   * on futures.
+   */
+  ExecutorService getListenerExecutorService();
+
+  /**
+   * Returns true if the default provided {@link ExecutorService} has not been
+   * overriden through the builder.
+   */
+  boolean isDefaultExecutorService();
 
   /**
    * Create a NodeLocator instance for the given list of nodes.
@@ -158,4 +174,22 @@ public interface ConnectionFactory {
    * Maximum number of timeout exception for shutdown connection.
    */
   int getTimeoutExceptionThreshold();
+
+  /**
+   * If true, metric collections are enabled.
+   */
+  MetricType enableMetrics();
+
+  /**
+   * The currently active {@link MetricCollector}.
+   */
+  MetricCollector getMetricCollector();
+
+  /**
+   * The time to wait until authentication completes when an operation is
+   * inserted.
+   *
+   * @return the time in milliseconds.
+   */
+  long getAuthWaitTime();
 }

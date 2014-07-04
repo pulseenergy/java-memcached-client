@@ -1,6 +1,6 @@
 /**
  * Copyright (C) 2006-2009 Dustin Sallings
- * Copyright (C) 2009-2011 Couchbase, Inc.
+ * Copyright (C) 2009-2013 Couchbase, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -28,10 +28,12 @@ import java.util.Collection;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import net.spy.memcached.internal.BulkFuture;
+import net.spy.memcached.internal.OperationFuture;
 import net.spy.memcached.transcoders.Transcoder;
 
 /**
@@ -73,10 +75,19 @@ public interface MemcachedClientIF {
 
   Future<CASResponse> asyncCAS(String key, long casId, Object value);
 
+  Future<CASResponse> asyncCAS(String key, long casId, int exp, Object value);
+
+  <T> OperationFuture<CASResponse> asyncCAS(String key, long casId, int exp,
+    T value, Transcoder<T> tc);
+
   <T> CASResponse cas(String key, long casId, int exp, T value,
       Transcoder<T> tc);
 
   CASResponse cas(String key, long casId, Object value);
+
+  CASResponse cas(String key, long casId, int exp, Object value);
+
+  <T> CASResponse cas(String key, long casId, T value, Transcoder<T> tc);
 
   <T> Future<Boolean> add(String key, int exp, T o, Transcoder<T> tc);
 
@@ -161,14 +172,6 @@ public interface MemcachedClientIF {
 
   long decr(String key, int by);
 
-  long incr(String key, long by, long def, int exp);
-
-  long incr(String key, int by, long def, int exp);
-
-  long decr(String key, long by, long def, int exp);
-
-  long decr(String key, int by, long def, int exp);
-
   Future<Long> asyncIncr(String key, long by);
 
   Future<Long> asyncIncr(String key, int by);
@@ -177,6 +180,22 @@ public interface MemcachedClientIF {
 
   Future<Long> asyncDecr(String key, int by);
 
+  long incr(String key, long by, long def, int exp);
+
+  long incr(String key, int by, long def, int exp);
+
+  long decr(String key, long by, long def, int exp);
+
+  long decr(String key, int by, long def, int exp);
+
+  Future<Long> asyncIncr(String key, long by, long def, int exp);
+
+  Future<Long> asyncIncr(String key, int by, long def, int exp);
+
+  Future<Long> asyncDecr(String key, long by, long def, int exp);
+
+  Future<Long> asyncDecr(String key, int by, long def, int exp);
+
   long incr(String key, long by, long def);
 
   long incr(String key, int by, long def);
@@ -184,6 +203,14 @@ public interface MemcachedClientIF {
   long decr(String key, long by, long def);
 
   long decr(String key, int by, long def);
+
+  Future<Long> asyncIncr(String key, long by, long def);
+
+  Future<Long> asyncIncr(String key, int by, long def);
+
+  Future<Long> asyncDecr(String key, long by, long def);
+
+  Future<Long> asyncDecr(String key, int by, long def);
 
   Future<Boolean> delete(String key);
 
@@ -202,6 +229,10 @@ public interface MemcachedClientIF {
   boolean addObserver(ConnectionObserver obs);
 
   boolean removeObserver(ConnectionObserver obs);
+
+  CountDownLatch broadcastOp(final BroadcastOpFactory of);
+  CountDownLatch broadcastOp(final BroadcastOpFactory of,
+    Collection<MemcachedNode> nodes);
 
   /**
    * Get the set of SASL mechanisms supported by the servers.

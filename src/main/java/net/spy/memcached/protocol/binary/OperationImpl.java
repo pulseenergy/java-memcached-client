@@ -36,12 +36,14 @@ import net.spy.memcached.ops.OperationCallback;
 import net.spy.memcached.ops.OperationErrorType;
 import net.spy.memcached.ops.OperationState;
 import net.spy.memcached.ops.OperationStatus;
+import net.spy.memcached.ops.StatusCode;
 import net.spy.memcached.protocol.BaseOperationImpl;
 
 /**
  * Base class for binary operations.
  */
-abstract class OperationImpl extends BaseOperationImpl implements Operation {
+public  abstract class OperationImpl extends BaseOperationImpl
+  implements Operation {
 
   protected static final byte REQ_MAGIC = (byte) 0x80;
   protected static final byte RES_MAGIC = (byte) 0x81;
@@ -69,7 +71,7 @@ abstract class OperationImpl extends BaseOperationImpl implements Operation {
   protected static final byte[] EMPTY_BYTES = new byte[0];
 
   protected static final OperationStatus STATUS_OK = new CASOperationStatus(
-      true, "OK", CASResponse.OK);
+      true, "OK", CASResponse.OK, StatusCode.SUCCESS);
 
   private static final AtomicInteger SEQ_NUMBER = new AtomicInteger(0);
 
@@ -81,6 +83,7 @@ abstract class OperationImpl extends BaseOperationImpl implements Operation {
   private final byte[] header = new byte[MIN_RECV_PACKET];
   private int headerOffset = 0;
   private byte[] payload = null;
+  private byte[] errorMsg = null;
 
   // Response header fields
   protected int keyLen;
@@ -110,63 +113,88 @@ abstract class OperationImpl extends BaseOperationImpl implements Operation {
     headerOffset = 0;
   }
 
-  // Base response packet format:
-  // 0 1 2 3 4 5 6 7 8 9 10 11
-  // # magic, opcode, keylen, extralen, datatype, status, bodylen,
-  // 12,3,4,5 16
-  // opaque, cas
-  // RES_PKT_FMT=">BBHBBHIIQ"
-
+  /**
+   * Read from the incoming {@link ByteBuffer}.
+   *
+   * Reading from the buffer is done in stages, depending on how much data
+   * can be read at once. First, the header is read and then parsed (24
+   * bytes, indicated by {@link #MIN_RECV_PACKET}). Then, the payload is read
+   * (if one is available for this operation and can be loaded fully).
+   *
+   * @param buffer the buffer to read from.
+   * @throws IOException if an error happened during parsing/reading.
+   */
   @Override
-  public void readFromBuffer(ByteBuffer b) throws IOException {
-    // First process headers if we haven't completed them yet
+  public void readFromBuffer(final ByteBuffer buffer) throws IOException {
     if (headerOffset < MIN_RECV_PACKET) {
-      int toRead = MIN_RECV_PACKET - headerOffset;
-      int available = b.remaining();
-      toRead = Math.min(toRead, available);
-      getLogger().debug("Reading {} header bytes", toRead);
-      b.get(header, headerOffset, toRead);
-      headerOffset += toRead;
-
-      // We've completed reading the header. Prepare body read.
+      readHeaderFromBuffer(buffer);
       if (headerOffset == MIN_RECV_PACKET) {
-        int magic = header[0];
-        assert magic == RES_MAGIC : "Invalid magic:  " + magic;
-        responseCmd = header[1];
-        assert cmd == DUMMY_OPCODE || responseCmd == cmd
-          : "Unexpected response command value";
-        keyLen = decodeShort(header, 2);
-        // TODO: Examine extralen and datatype
-        errorCode = decodeShort(header, 6);
-        int bytesToRead = decodeInt(header, 8);
-        payload = new byte[bytesToRead];
-        responseOpaque = decodeInt(header, 12);
-        responseCas = decodeLong(header, 16);
-        assert opaqueIsValid() : "Opaque is not valid";
+        parseHeaderFromBuffer();
       }
     }
 
-    // Now process the payload if we can.
     if (headerOffset >= MIN_RECV_PACKET && payload == null) {
       finishedPayload(EMPTY_BYTES);
     } else if (payload != null) {
-      int toRead = payload.length - payloadOffset;
-      int available = b.remaining();
-      toRead = Math.min(toRead, available);
-      getLogger().debug("Reading {} payload bytes", toRead);
-      b.get(payload, payloadOffset, toRead);
-      payloadOffset += toRead;
-
-      // Have we read it all?
-      if (payloadOffset == payload.length) {
-        finishedPayload(payload);
-      }
+      readPayloadFromBuffer(buffer);
     } else {
-      // Haven't read enough to make up a payload. Must read more.
       getLogger().debug("Only read {} of the {} needed to fill a header",
-          headerOffset, MIN_RECV_PACKET);
+        headerOffset, MIN_RECV_PACKET);
     }
 
+  }
+
+  /**
+   * Read the header bytes from the incoming {@link ByteBuffer}.
+   *
+   * @param buffer the buffer to read from.
+   */
+  private void readHeaderFromBuffer(final ByteBuffer buffer) {
+    int toRead = MIN_RECV_PACKET - headerOffset;
+    int available = buffer.remaining();
+    toRead = Math.min(toRead, available);
+    getLogger().debug("Reading {} header bytes", toRead);
+    buffer.get(header, headerOffset, toRead);
+    headerOffset += toRead;
+  }
+
+  /**
+   * Parse the header info out of the buffer.
+   */
+  private void parseHeaderFromBuffer() {
+    int magic = header[0];
+    assert magic == RES_MAGIC : "Invalid magic:  " + magic;
+    responseCmd = header[1];
+    assert cmd == DUMMY_OPCODE || responseCmd == cmd
+      : "Unexpected response command value";
+    keyLen = decodeShort(header, 2);
+    errorCode = decodeShort(header, 6);
+    int bytesToRead = decodeInt(header, 8);
+    payload = new byte[bytesToRead];
+    responseOpaque = decodeInt(header, 12);
+    responseCas = decodeLong(header, 16);
+    assert opaqueIsValid() : "Opaque is not valid";
+  }
+
+  /**
+   * Read the payload from the buffer.
+   *
+   * @param buffer the buffer to read from.
+   * @throws IOException if an error occures during payload finishing.
+   */
+  private void readPayloadFromBuffer(final ByteBuffer buffer)
+    throws IOException {
+    int toRead = payload.length - payloadOffset;
+    int available = buffer.remaining();
+    toRead = Math.min(toRead, available);
+    getLogger().debug("Reading {} payload bytes", toRead);
+    buffer.get(payload, payloadOffset, toRead);
+    payloadOffset += toRead;
+
+
+    if (payloadOffset == payload.length) {
+      finishedPayload(payload);
+    }
   }
 
   protected void finishedPayload(byte[] pl) throws IOException {
@@ -194,32 +222,38 @@ abstract class OperationImpl extends BaseOperationImpl implements Operation {
    */
   protected OperationStatus getStatusForErrorCode(int errCode, byte[] errPl)
     throws IOException {
-    switch (errCode) {
-    case SUCCESS:
-      return STATUS_OK;
-    case ERR_NOT_FOUND:
-      return new CASOperationStatus(false, new String(errPl),
-          CASResponse.NOT_FOUND);
-    case ERR_EXISTS:
-      return new CASOperationStatus(false, new String(errPl),
-          CASResponse.EXISTS);
-    case ERR_NOT_STORED:
-      return new CASOperationStatus(false, new String(errPl),
-          CASResponse.NOT_FOUND);
-    case ERR_2BIG:
-    case ERR_INTERNAL:
-      handleError(OperationErrorType.SERVER, new String(errPl));
-    case ERR_INVAL:
-    case ERR_DELTA_BADVAL:
-    case ERR_NOT_MY_VBUCKET:
-    case ERR_UNKNOWN_COMMAND:
-    case ERR_NO_MEM:
-    case ERR_NOT_SUPPORTED:
-    case ERR_BUSY:
-    case ERR_TEMP_FAIL:
-      return new OperationStatus(false, new String(errPl));
-    default:
-      return null;
+
+    if(errCode == SUCCESS) {
+        return STATUS_OK;
+    } else {
+        StatusCode statusCode = StatusCode.fromBinaryCode(errCode);
+        errorMsg = errPl.clone();
+
+        switch (errCode) {
+            case ERR_NOT_FOUND:
+                return new CASOperationStatus(false, new String(errPl),
+                        CASResponse.NOT_FOUND, statusCode);
+            case ERR_EXISTS:
+                return new CASOperationStatus(false, new String(errPl),
+                        CASResponse.EXISTS, statusCode);
+            case ERR_NOT_STORED:
+                return new CASOperationStatus(false, new String(errPl),
+                        CASResponse.NOT_FOUND, statusCode);
+            case ERR_2BIG:
+            case ERR_INTERNAL:
+                handleError(OperationErrorType.SERVER, new String(errPl));
+            case ERR_INVAL:
+            case ERR_DELTA_BADVAL:
+            case ERR_NOT_MY_VBUCKET:
+            case ERR_UNKNOWN_COMMAND:
+            case ERR_NO_MEM:
+            case ERR_NOT_SUPPORTED:
+            case ERR_BUSY:
+            case ERR_TEMP_FAIL:
+                return new OperationStatus(false, new String(errPl), statusCode);
+            default:
+                return null;
+        }
     }
   }
 
@@ -279,15 +313,78 @@ abstract class OperationImpl extends BaseOperationImpl implements Operation {
   }
 
   /**
-   * Prepare a send buffer.
+   * Prepare the buffer for sending.
    *
-   * @param key the key (for keyed ops)
-   * @param cas the cas value
-   * @param val the data payload
-   * @param extraHeaders any additional headers that need to be sent
+   * @param key the key (for keyed ops).
+   * @param cas the cas value.
+   * @param val the data payload.
+   * @param extraHeaders any additional headers that need to be sent.
    */
-  protected void prepareBuffer(String key, long cas, byte[] val,
-      Object... extraHeaders) {
+  protected void prepareBuffer(final String key, final long cas,
+    final byte[] val, final Object... extraHeaders) {
+    int extraLen = 0;
+    int extraHeadersLength = extraHeaders.length;
+
+    if (extraHeadersLength > 0) {
+      extraLen = calculateExtraLength(extraHeaders);
+    }
+
+    final byte[] keyBytes = KeyUtil.getKeyBytes(key);
+    int bufSize = MIN_RECV_PACKET + keyBytes.length + val.length;
+
+    ByteBuffer bb = ByteBuffer.allocate(bufSize + extraLen);
+    assert bb.order() == ByteOrder.BIG_ENDIAN;
+    bb.put(REQ_MAGIC);
+    bb.put(cmd);
+    bb.putShort((short) keyBytes.length);
+    bb.put((byte) extraLen);
+    bb.put((byte) 0);
+    bb.putShort(vbucket);
+    bb.putInt(keyBytes.length + val.length + extraLen);
+    bb.putInt(opaque);
+    bb.putLong(cas);
+
+    if (extraHeadersLength > 0) {
+      addExtraHeaders(bb, extraHeaders);
+    }
+
+    bb.put(keyBytes);
+    bb.put(val);
+
+    bb.flip();
+    setBuffer(bb);
+  }
+
+  /**
+   * Add the extra headers to the write {@link ByteBuffer}.
+   *
+   * @param bb the buffer where to append.
+   * @param extraHeaders the headers to append.
+   */
+  private void addExtraHeaders(final ByteBuffer bb,
+    final Object... extraHeaders) {
+    for (Object o : extraHeaders) {
+      if (o instanceof Integer) {
+        bb.putInt((Integer) o);
+      } else if (o instanceof byte[]) {
+        bb.put((byte[]) o);
+      } else if (o instanceof Long) {
+        bb.putLong((Long) o);
+      } else if (o instanceof Short) {
+        bb.putShort((Short) o);
+      } else {
+        assert false : "Unhandled extra header type:  " + o.getClass();
+      }
+    }
+  }
+
+  /**
+   * Calculate the length of all extra headers.
+   *
+   * @param extraHeaders the list of extra headers to count.
+   * @return the length of the extra headers.
+   */
+  private int calculateExtraLength(final Object... extraHeaders) {
     int extraLen = 0;
     for (Object o : extraHeaders) {
       if (o instanceof Integer) {
@@ -302,47 +399,7 @@ abstract class OperationImpl extends BaseOperationImpl implements Operation {
         assert false : "Unhandled extra header type:  " + o.getClass();
       }
     }
-    final byte[] keyBytes = KeyUtil.getKeyBytes(key);
-    int bufSize = MIN_RECV_PACKET + keyBytes.length + val.length;
-
-    // # magic, opcode, keylen, extralen, datatype, [reserved],
-    // bodylen, opaque, cas
-    // REQ_PKT_FMT=">BBHBBxxIIQ"
-
-    // set up the initial header stuff
-    ByteBuffer bb = ByteBuffer.allocate(bufSize + extraLen);
-    assert bb.order() == ByteOrder.BIG_ENDIAN;
-    bb.put(REQ_MAGIC);
-    bb.put(cmd);
-    bb.putShort((short) keyBytes.length);
-    bb.put((byte) extraLen);
-    bb.put((byte) 0); // data type
-    bb.putShort(vbucket); // vbucket
-    bb.putInt(keyBytes.length + val.length + extraLen);
-    bb.putInt(opaque);
-    bb.putLong(cas);
-
-    // Add the extra headers.
-    for (Object o : extraHeaders) {
-      if (o instanceof Integer) {
-        bb.putInt((Integer) o);
-      } else if (o instanceof byte[]) {
-        bb.put((byte[]) o);
-      } else if (o instanceof Long) {
-        bb.putLong((Long) o);
-      } else if (o instanceof Short) {
-        bb.putShort((Short) o);
-      } else {
-        assert false : "Unhandled extra header type:  " + o.getClass();
-      }
-    }
-
-    // Add the normal stuff
-    bb.put(keyBytes);
-    bb.put(val);
-
-    bb.flip();
-    setBuffer(bb);
+    return extraLen;
   }
 
   /**
@@ -361,4 +418,10 @@ abstract class OperationImpl extends BaseOperationImpl implements Operation {
   public String toString() {
     return "Cmd: " + cmd + " Opaque: " + opaque;
   }
+
+  @Override
+  public byte[] getErrorMsg() {
+    return errorMsg;
+  }
+
 }

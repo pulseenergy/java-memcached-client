@@ -1,6 +1,6 @@
 /**
  * Copyright (C) 2006-2009 Dustin Sallings
- * Copyright (C) 2009-2011 Couchbase, Inc.
+ * Copyright (C) 2009-2013 Couchbase, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -30,6 +30,7 @@ import java.util.Map;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -38,6 +39,7 @@ import net.spy.memcached.MemcachedConnection;
 import net.spy.memcached.ops.Operation;
 import net.spy.memcached.ops.OperationState;
 import net.spy.memcached.ops.OperationStatus;
+import net.spy.memcached.ops.StatusCode;
 import org.slf4j.LoggerFactory;
 
 /**
@@ -47,7 +49,10 @@ import org.slf4j.LoggerFactory;
  *
  * @param <T> types of objects returned from the GET
  */
-public class BulkGetFuture<T> implements BulkFuture<Map<String, T>> {
+public class BulkGetFuture<T>
+  extends AbstractListenableFuture<Map<String, T>, BulkGetCompletionListener>
+  implements BulkFuture<Map<String, T>> {
+
   private final Map<String, Future<T>> rvMap;
   private final Collection<Operation> ops;
   private final CountDownLatch latch;
@@ -56,8 +61,8 @@ public class BulkGetFuture<T> implements BulkFuture<Map<String, T>> {
   private boolean timeout = false;
 
   public BulkGetFuture(Map<String, Future<T>> m, Collection<Operation> getOps,
-      CountDownLatch l) {
-    super();
+      CountDownLatch l, ExecutorService service) {
+    super(service);
     rvMap = m;
     ops = getOps;
     latch = l;
@@ -74,7 +79,8 @@ public class BulkGetFuture<T> implements BulkFuture<Map<String, T>> {
       v.cancel(ign);
     }
     cancelled = true;
-    status = new OperationStatus(false, "Cancelled");
+    status = new OperationStatus(false, "Cancelled", StatusCode.CANCELLED);
+    notifyListeners();
     return rv;
   }
 
@@ -168,7 +174,7 @@ public class BulkGetFuture<T> implements BulkFuture<Map<String, T>> {
       try {
         get();
       } catch (InterruptedException e) {
-        status = new OperationStatus(false, "Interrupted");
+        status = new OperationStatus(false, "Interrupted", StatusCode.INTERRUPTED);
         Thread.currentThread().interrupt();
       } catch (ExecutionException e) {
         return status;
@@ -197,4 +203,26 @@ public class BulkGetFuture<T> implements BulkFuture<Map<String, T>> {
   public boolean isTimeout() {
     return timeout;
   }
+
+  @Override
+  public Future<Map<String, T>> addListener(
+    BulkGetCompletionListener listener) {
+    super.addToListeners((GenericCompletionListener) listener);
+    return this;
+  }
+
+  @Override
+  public Future<Map<String, T>> removeListener(
+    BulkGetCompletionListener listener) {
+    super.removeFromListeners((GenericCompletionListener) listener);
+    return this;
+  }
+
+  /**
+   * Signals that this future is complete.
+   */
+  public void signalComplete() {
+    notifyListeners();
+  }
+
 }

@@ -30,19 +30,30 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import static junit.framework.Assert.assertEquals;
+import static junit.framework.Assert.assertSame;
+import static junit.framework.Assert.assertTrue;
 
 import net.spy.memcached.compat.SyncThread;
 import net.spy.memcached.internal.BulkFuture;
+import net.spy.memcached.internal.BulkGetFuture;
+import net.spy.memcached.internal.BulkGetCompletionListener;
 import net.spy.memcached.internal.GetFuture;
+import net.spy.memcached.internal.GetCompletionListener;
 import net.spy.memcached.internal.OperationFuture;
+import net.spy.memcached.internal.OperationCompletionListener;
 import net.spy.memcached.ops.OperationErrorType;
 import net.spy.memcached.ops.OperationException;
+import net.spy.memcached.ops.OperationStatus;
+import net.spy.memcached.ops.StatusCode;
 import net.spy.memcached.transcoders.SerializingTranscoder;
 import net.spy.memcached.transcoders.Transcoder;
 
@@ -162,6 +173,18 @@ public abstract class ProtocolBaseCase extends ClientBaseCase {
     assertSame("Expected unsuccessful CAS with replayed id",
         CASResponse.EXISTS, client.cas(key, getsVal.getCas(), "crap value"));
     assertEquals("new value", client.get(key));
+
+    final String key2 = "castestkey2";
+
+    assertTrue(client.add(key2, 0, "value").get());
+    CASValue<Object> casValue = client.gets(key2);
+
+    assertEquals(CASResponse.OK,
+      client.cas(key2, casValue.getCas(), 3, "new val"));
+
+    // Verify the doc is not there anymore
+    Thread.sleep(5000);
+    assertNull(client.get(key2));
   }
 
   public void testReallyLongCASId() throws Exception {
@@ -521,32 +544,38 @@ public abstract class ProtocolBaseCase extends ClientBaseCase {
     assertEquals(9, client.decr("mtest2", 1, 9, 1));
     Thread.sleep(2000);
     assertNull(client.get("mtest"));
-    assert !client.asyncGet("mtest").getStatus().isSuccess();
+    OperationStatus status = client.asyncGet("mtest").getStatus();
+    assertFalse(status.isSuccess());
+    assertEquals(StatusCode.ERR_NOT_FOUND, status.getStatusCode());
   }
 
   public void testAsyncIncrement() throws Exception {
     String k = "async-incr";
     client.set(k, 0, "5");
-    Future<Long> f = client.asyncIncr(k, 1);
+    OperationFuture<Long> f = client.asyncIncr(k, 1);
+    assertEquals(StatusCode.SUCCESS, f.getStatus().getStatusCode());
     assertEquals(6, (long) f.get());
   }
 
   public void testAsyncIncrementNonExistent() throws Exception {
     String k = "async-incr-non-existent";
-    Future<Long> f = client.asyncIncr(k, 1);
+    OperationFuture<Long> f = client.asyncIncr(k, 1);
+    assertEquals(StatusCode.ERR_NOT_FOUND, f.getStatus().getStatusCode());
     assertEquals(-1, (long) f.get());
   }
 
   public void testAsyncDecrement() throws Exception {
     String k = "async-decr";
     client.set(k, 0, "5");
-    Future<Long> f = client.asyncDecr(k, 1);
+    OperationFuture<Long> f = client.asyncDecr(k, 1);
+    assertEquals(StatusCode.SUCCESS, f.getStatus().getStatusCode());
     assertEquals(4, (long) f.get());
   }
 
   public void testAsyncDecrementNonExistent() throws Exception {
     String k = "async-decr-non-existent";
-    Future<Long> f = client.asyncDecr(k, 1);
+    OperationFuture<Long> f = client.asyncDecr(k, 1);
+    assertEquals(StatusCode.ERR_NOT_FOUND, f.getStatus().getStatusCode());
     assertEquals(-1, (long) f.get());
   }
 
@@ -866,6 +895,7 @@ public abstract class ProtocolBaseCase extends ClientBaseCase {
     assertTrue(client.set(key, 5, "test").get());
     OperationFuture<Boolean> op = client.append(0, key, "es");
     assertTrue(op.get());
+    assertEquals(StatusCode.SUCCESS, op.getStatus().getStatusCode());
     assert op.getStatus().isSuccess();
     assertEquals("testes", client.get(key));
   }
@@ -875,6 +905,7 @@ public abstract class ProtocolBaseCase extends ClientBaseCase {
     assertTrue(client.set(key, 5, "test").get());
     OperationFuture<Boolean> op = client.prepend(0, key, "es");
     assertTrue(op.get());
+    assertEquals(StatusCode.SUCCESS, op.getStatus().getStatusCode());
     assert op.getStatus().isSuccess();
     assertEquals("estest", client.get(key));
   }
@@ -915,6 +946,69 @@ public abstract class ProtocolBaseCase extends ClientBaseCase {
             0, "testSetReturnsCAS");
     setOp.get();
     assertTrue(setOp.getCas() > 0);
+  }
+
+  public void testSetWithCallback() throws Exception {
+    OperationFuture<Boolean> setOp =
+      client.set("setWithCallback", 0, "content");
+
+    final CountDownLatch latch = new CountDownLatch(1);
+    setOp.addListener(new OperationCompletionListener() {
+      @Override
+      public void onComplete(OperationFuture<?> f) throws Exception {
+        latch.countDown();
+      }
+    });
+
+    assertTrue(latch.await(2, TimeUnit.SECONDS));
+  }
+
+  public void testGetWithCallback() throws Exception {
+    client.set("getWithCallback", 0, "content").get();
+
+    GetFuture<Object> getOp = client.asyncGet("getWithCallback");
+
+    final CountDownLatch latch = new CountDownLatch(1);
+    getOp.addListener(new GetCompletionListener() {
+      @Override
+      public void onComplete(GetFuture<?> f) throws Exception {
+        latch.countDown();
+      }
+    });
+
+    assertTrue(latch.await(2, TimeUnit.SECONDS));
+  }
+
+  public void testGetBulkWithCallback() throws Exception {
+    final int items = 1000;
+    List<String> keysList = new ArrayList<String>(items);
+    for (int i = 0; i < items; i++) {
+      assertTrue(client.set("getBulkWithCallback" + i, 0, "content").get());
+      keysList.add("getBulkWithCallback" + i);
+    }
+
+    BulkFuture<Map<String, Object>> asyncGetBulk =
+      client.asyncGetBulk(keysList);
+
+    final CountDownLatch latch = new CountDownLatch(1);
+    asyncGetBulk.addListener(new BulkGetCompletionListener() {
+      @Override
+      public void onComplete(BulkGetFuture<?> f) throws Exception {
+        assertEquals(items, f.get().size());
+        assertTrue(f.getStatus().isSuccess());
+        assertTrue(f.isDone());
+        assertFalse(f.isCancelled());
+        assertEquals(StatusCode.SUCCESS, f.getStatus().getStatusCode());
+        latch.countDown();
+      }
+    });
+
+    assertTrue(latch.await(2, TimeUnit.SECONDS));
+  }
+
+  public void testEmptyGetBulk() throws Exception {
+    Map<String, Object> bulk = client.getBulk(Collections.<String>emptyList());
+    assertTrue(bulk.isEmpty());
   }
 
   private static class TestTranscoder implements Transcoder<String> {

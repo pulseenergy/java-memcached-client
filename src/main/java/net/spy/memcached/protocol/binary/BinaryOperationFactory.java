@@ -23,12 +23,6 @@
 
 package net.spy.memcached.protocol.binary;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Map;
-
-import javax.security.auth.callback.CallbackHandler;
-
 import net.spy.memcached.ops.BaseOperationFactory;
 import net.spy.memcached.ops.CASOperation;
 import net.spy.memcached.ops.ConcatenationOperation;
@@ -51,6 +45,7 @@ import net.spy.memcached.ops.ObserveOperation;
 import net.spy.memcached.ops.Operation;
 import net.spy.memcached.ops.OperationCallback;
 import net.spy.memcached.ops.ReplicaGetOperation;
+import net.spy.memcached.ops.ReplicaGetsOperation;
 import net.spy.memcached.ops.SASLAuthOperation;
 import net.spy.memcached.ops.SASLMechsOperation;
 import net.spy.memcached.ops.SASLStepOperation;
@@ -62,6 +57,11 @@ import net.spy.memcached.ops.UnlockOperation;
 import net.spy.memcached.ops.VersionOperation;
 import net.spy.memcached.tapmessage.RequestMessage;
 import net.spy.memcached.tapmessage.TapOpcode;
+
+import javax.security.auth.callback.CallbackHandler;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Map;
 
 /**
  * Factory for binary operations.
@@ -102,6 +102,11 @@ public class BinaryOperationFactory extends BaseOperationFactory {
   public ReplicaGetOperation replicaGet(String key, int index,
     ReplicaGetOperation.Callback callback) {
     return new ReplicaGetOperationImpl(key, index, callback);
+  }
+
+  public ReplicaGetsOperation replicaGets(String key, int index,
+    ReplicaGetsOperation.Callback callback) {
+    return new ReplicaGetsOperationImpl(key, index, callback);
   }
 
   public GetOperation get(Collection<String> value, Callback cb) {
@@ -178,7 +183,7 @@ public class BinaryOperationFactory extends BaseOperationFactory {
       if(getCb != null) {
         rv.add(get(k, getCb));
       } else if(getsCb != null) {
-        rv.add(get(k, getCb));
+        rv.add(gets(k, getsCb));
       } else {
         rv.add(replicaGet(k, ((ReplicaGetOperationImpl)op).getReplicaIndex() ,replicaGetCb));
       }
