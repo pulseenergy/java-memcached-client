@@ -202,7 +202,7 @@ public class AuthThread extends SpyThread {
           - stepStart);
         msg = String.format("SASL Step took %dms on %s",
           stepDiff, node.toString());
-        if (mechsDiff >= AUTH_ROUNDTRIP_THRESHOLD) {
+        if (stepDiff >= AUTH_ROUNDTRIP_THRESHOLD) {
             getLogger().warn(msg);
         } else {
             getLogger().debug(msg);
@@ -223,7 +223,7 @@ public class AuthThread extends SpyThread {
       - totalStart);
     msg = String.format("SASL Auth took %dms on %s",
       totalDiff, node.toString());
-    if (mechsDiff >= AUTH_TOTAL_THRESHOLD) {
+    if (totalDiff >= AUTH_TOTAL_THRESHOLD) {
         getLogger().warn(msg);
     } else {
         getLogger().debug(msg);
