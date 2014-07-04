@@ -201,7 +201,7 @@ public class AuthThread extends SpyThread {
           - stepStart);
         msg = String.format("SASL Step took %dms on %s",
           stepDiff, node.toString());
-        level = mechsDiff
+        level = stepDiff
           >= AUTH_ROUNDTRIP_THRESHOLD ? Level.WARN : Level.DEBUG;
         getLogger().log(level, msg);
       }
@@ -220,7 +220,7 @@ public class AuthThread extends SpyThread {
       - totalStart);
     msg = String.format("SASL Auth took %dms on %s",
       totalDiff, node.toString());
-    level = mechsDiff >= AUTH_TOTAL_THRESHOLD ? Level.WARN : Level.DEBUG;
+    level = totalDiff >= AUTH_TOTAL_THRESHOLD ? Level.WARN : Level.DEBUG;
     getLogger().log(level, msg);
   }
 
